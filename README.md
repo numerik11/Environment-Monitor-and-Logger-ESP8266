@@ -22,6 +22,6 @@
 
 - BL_PIN      D6
 
-                               ===================== User Interface. =====================
+                                 ===================== User Interface. =====================
 
 <img width="1087" height="800" alt="image" src="https://github.com/user-attachments/assets/738fc69b-f15a-48d0-b92f-c4becf50f6f7" />
