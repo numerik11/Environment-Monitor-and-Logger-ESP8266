@@ -1,17 +1,14 @@
 /*********************************************************
  * Environment Monitor (ESP8266 D1 R1 + ILI9341 + SCD30)
- * - 5-min slots (288/day), LittleFS persistence
+ * - 2-min slots (720/day), LittleFS persistence
  * - Web UI: 30-day history + Today (live)
  *
- * Button (NC to GND):
- *  - Not pressed: pin LOW (grounded)
- *  - Pressed: contact opens, pin HIGH (INPUT_PULLUP)
- *  - Interrupt on RISING (LOW->HIGH)
- *
- * Long-press:
- *  - Hold 5s -> shows "Force 400 ppm?" confirm overlay
- *  - Then short-press within 5s to confirm calibration
- *********************************************************/
+ * Button (NO to GND):
+ *  - Not pressed: pin HIGH (INPUT_PULLUP)
+ *  - Pressed: contact closes, pin LOW (to GND)
+ *  - Interrupt on FALLING (HIGH->LOW)
+ *  - Short-press: cycle screens (long-press unused)
+*********************************************************/
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
@@ -19,6 +16,8 @@
 #include <DNSServer.h>
 #include <WiFiManager.h>
 #include <ESP8266mDNS.h>
+#include <ArduinoOTA.h>
+#include <ESP8266HTTPClient.h>
 #include <time.h>
 #include <Wire.h>
 #include <SPI.h>
@@ -32,11 +31,88 @@
 
 // ===================== Config =====================
 #define ENABLE_FS 1
-#define SCD30_ASC 1
 #define DEBUG_HEAP 0
+#define SCD30_ASC 1
 
 #ifndef ENABLE_BL_HTTP
-  #define ENABLE_BL_HTTP 0
+  #define ENABLE_BL_HTTP 1
+#endif
+
+#ifndef ENABLE_CO2_OFFSET_HTTP
+  #define ENABLE_CO2_OFFSET_HTTP 1
+#endif
+
+#ifndef FS_AUTOFORMAT_ON_FAIL
+  #define FS_AUTOFORMAT_ON_FAIL 1  // format LittleFS if mount fails (clears existing data)
+#endif
+
+#ifndef ENABLE_LDR_SLEEP
+  #define ENABLE_LDR_SLEEP 0   // set to 1 to enable LDR-based dark sleep (uses A0; disables battery read)
+#endif
+
+#ifndef ENABLE_BATTERY_READ
+  #define ENABLE_BATTERY_READ 1
+#endif
+
+#ifndef BUTTON_USE_A0
+  #define BUTTON_USE_A0 0
+#endif
+
+#if BUTTON_USE_A0
+  #undef ENABLE_BATTERY_READ
+  #define ENABLE_BATTERY_READ 0
+  #undef ENABLE_LDR_SLEEP
+  #define ENABLE_LDR_SLEEP 0
+#endif
+
+#ifndef ENABLE_OTA
+  #define ENABLE_OTA 1
+#endif
+#ifndef OTA_HOSTNAME
+  #define OTA_HOSTNAME "envmonitor"
+#endif
+#ifndef OTA_PORT
+  #define OTA_PORT 8266
+#endif
+
+#ifndef DEFAULT_WIFI_SSID
+  #define DEFAULT_WIFI_SSID "VX220-C1DD"
+#endif
+#ifndef DEFAULT_WIFI_PASS
+  #define DEFAULT_WIFI_PASS "speeduino11"
+#endif
+
+// ===================== AC Control (HTTP) =====================
+#ifndef ENABLE_AC_HTTP
+  #define ENABLE_AC_HTTP 1
+#endif
+#ifndef AC_HTTP_HOST
+  #define AC_HTTP_HOST "ac-control.local"
+#endif
+#ifndef AC_HTTP_TICK_MS
+  #define AC_HTTP_TICK_MS 5000UL
+#endif
+#ifndef AC_HTTP_MIN_SEND_MS
+  #define AC_HTTP_MIN_SEND_MS 15000UL
+#endif
+
+#ifndef BAT_VDIV
+  // Analog pin uses 1.0V full-scale on ESP8266; adjust divider gain as needed
+  #define BAT_VDIV 4.40f
+#endif
+#ifndef BAT_VREF
+  #define BAT_VREF 1.00f
+#endif
+#define BATTERY_READ_INTERVAL_MS 10000UL
+
+#if ENABLE_LDR_SLEEP
+  // LDR on A0 (voltage divider to 1.0V max). Deep sleep requires D0->RST.
+  #define LDR_PIN A0
+  #define LDR_DARK_THRESHOLD    220   // lower = darker (0..1023)
+  #define LDR_LIGHT_THRESHOLD   260   // hysteresis release
+  #define LDR_DARK_HOLD_MS      60000UL
+  #define LDR_SAMPLE_INTERVAL_MS 2000UL
+  #define LDR_SLEEP_SECONDS     900UL // sleep duration when dark (15 min)
 #endif
 
 #if ENABLE_FS
@@ -52,13 +128,52 @@
 #define BUTTON_PIN  D0
 #define BL_PIN      D6
 
-#define NUM_SCREENS 6
+#define NUM_SCREENS 4
 // ===================== Backlight control (ESP8266 PWM) =====================
 static const uint16_t BL_RANGE  = 1023;
 static const uint16_t BL_PWM_HZ = 20000;
-static uint16_t blValue = 750;
+static uint16_t blValue = 900;
 static unsigned long _blLastReapply = 0;
+static bool screenOff = false;
+static bool screenOffForced = false;
+static bool screenOffBySchedule = false;
+static bool screenOffByAuto = false;
+static uint32_t screenAutoOffMs = 0;   // 0 = disabled
+static bool screenScheduleEnabled = false;
+static uint16_t screenScheduleOffMin = 0;
+static uint16_t screenScheduleOnMin = 0;
+static bool screenScheduleOverride = false;
+static uint32_t lastUserActivityMs = 0;
+static bool screenWakeReq = false;
 volatile bool nextScreenReq = false;
+
+static inline uint8_t getBrightnessPct(){
+  return (uint8_t)min(100, (int)((blValue * 100 + (BL_RANGE/2)) / BL_RANGE));
+}
+static inline void applyBacklightOutput(){
+  analogWrite(BL_PIN, screenOff ? 0 : blValue);
+  _blLastReapply = millis();
+}
+static inline void applyBrightnessPct(int pct){
+  pct = constrain(pct, 0, 100);
+  blValue = (uint16_t)((pct * BL_RANGE) / 100);
+  applyBacklightOutput();
+}
+
+static inline void noteUserActivity(bool wakeAllowed){
+  lastUserActivityMs = millis();
+  if (wakeAllowed && screenOff && !screenOffBySchedule) {
+    screenOff = false;
+    screenOffForced = false;
+    screenOffByAuto = false;
+    applyBacklightOutput();
+    screenWakeReq = true;
+  }
+}
+
+// ===================== Battery (A0) =====================
+static float batteryV = NAN;
+static uint32_t lastBatteryReadMs = 0;
 
 // ===================== Wi-Fi / TZ =====================
 ESP8266WebServer server(80);
@@ -69,28 +184,31 @@ static const char* TZ_ADELAIDE = "ACST-9:30ACDT-10:30,M10.1.0/2,M4.1.0/3";
 
 // ===================== TFT =====================
 Adafruit_ILI9341 tft(TFT_CS, TFT_DC);
-static const int16_t SCREEN_WIDTH  = 320;
-static const int16_t SCREEN_HEIGHT = 240;
+static const int16_t SCREEN_WIDTH   = 320;
+static const int16_t SCREEN_HEIGHT  = 240;
 
 #define RGB565(r,g,b) (((r&0xF8)<<8)|((g&0xFC)<<3)|((b)>>3))
-static const uint16_t COL_BG        = RGB565(12,14,18);
-static const uint16_t COL_CARD      = RGB565(24,28,34);
-static const uint16_t COL_CARD_EDGE = RGB565(48,54,62);
-static const uint16_t COL_GRID      = RGB565(60,68,78);
-static const uint16_t COL_TEXT      = ILI9341_WHITE;
-static const uint16_t COL_MUTED     = RGB565(160,170,186);
-static const uint16_t COL_ACCENT    = RGB565(250,210,80);
+static const uint16_t COL_BG        = RGB565(8,10,14);
+static const uint16_t COL_CARD      = RGB565(18,22,30);
+static const uint16_t COL_CARD_EDGE = RGB565(70,80,92);
+static const uint16_t COL_GRID      = RGB565(35,40,48);
+static const uint16_t COL_TEXT      = RGB565(255,255,255);
+static const uint16_t COL_MUTED     = RGB565(170,180,195);
+static const uint16_t COL_ACCENT    = RGB565(255,215,90);
 static const uint16_t COL_CO2       = RGB565(255,120,90);
-static const uint16_t COL_TEMP      = RGB565(80,210,255);
-static const uint16_t COL_HUM       = RGB565(140,180,255);
-static const uint16_t COL_VALUE_BG  = RGB565(34,38,46);
-static const uint16_t COL_GOOD      = RGB565(70,160,120);
-static const uint16_t COL_WARN      = RGB565(220,180,60);
-static const uint16_t COL_BAD       = RGB565(220,80,80);
+static const uint16_t COL_TEMP      = RGB565(0,255,255);
+static const uint16_t COL_HUM       = RGB565(180,220,255);
+static const uint16_t COL_VALUE_BG  = RGB565(30,36,44);
+static const uint16_t COL_GOOD      = RGB565(90,200,140);
+static const uint16_t COL_WARN      = RGB565(230,190,70);
+static const uint16_t COL_BAD       = RGB565(240,90,90);
 
 // ===================== UI layout =====================
 struct Panel { int16_t x,y,w,h; };
 static Panel header = {0,0,SCREEN_WIDTH,36};
+static inline Panel makePanel(int x, int y, int w, int h) {
+  return Panel{(int16_t)x, (int16_t)y, (int16_t)w, (int16_t)h};
+}
 
 static const uint8_t UI_RADIUS = 8;
 static const int UI_TAB_H              = 18;
@@ -108,10 +226,13 @@ struct GridRect { int gx0,gx1,gy0,gy1; };
 struct AxisScale { float vmin; float vmax; float step; int tickCount; float ticks[6]; };
 
 // ===================== Sensor =====================
-Adafruit_SCD30 scd30;
+static Adafruit_SCD30 scd30;
 
 // ===================== Data buffers =====================
-static const int SLOTS_PER_DAY = 288; // 5-min bins
+#define SLOT_MINUTES 2
+static const int SLOTS_PER_DAY  = 1440 / SLOT_MINUTES;
+static const int SLOTS_PER_12H  = (12 * 60) / SLOT_MINUTES;
+static const int SLOTS_PER_24H  = (24 * 60) / SLOT_MINUTES;
 
 static uint16_t co2Slots[SLOTS_PER_DAY];
 static uint8_t  tempSlots[SLOTS_PER_DAY];
@@ -122,15 +243,68 @@ static uint8_t encodeTemp(float t){ return constrain((int)((t+10.0f)*2.0f), 0, 2
 static float   decodeHum (uint8_t v){ return v / 2.0f; }
 static uint8_t encodeHum (float h){ return constrain((int)(h*2.0f), 0, 200); }
 
+// ADC to battery volts (expects external divider to A0)
+static float readBatteryVolts(){
+  int raw = analogRead(A0);
+  if (raw < 0) return NAN;
+  float v = (raw / 1023.0f) * BAT_VREF * BAT_VDIV;
+  if (v < 0.f || v > 6.0f) return NAN;
+  return v;
+}
+
+#if ENABLE_LDR_SLEEP
+// ---------- LDR-based dark detection / sleep ----------
+static uint32_t lastLdrReadMs = 0;
+static uint32_t darkSinceMs   = 0;
+static uint16_t ldrFiltered   = 1023;
+
+static void enterDarkSleep(){
+  Serial.printf("Dark detected (ldr=%u) -> sleeping for %lus\n",
+                (unsigned)ldrFiltered, (unsigned long)LDR_SLEEP_SECONDS);
+  applyBrightnessPct(0);
+  delay(50);
+  ESP.deepSleep((uint64_t)LDR_SLEEP_SECONDS * 1000000ULL, WAKE_RF_DEFAULT);
+}
+
+static void handleLdrAndSleep(uint32_t nowMs){
+  if (nowMs - lastLdrReadMs < LDR_SAMPLE_INTERVAL_MS) return;
+  lastLdrReadMs = nowMs;
+
+  int raw = analogRead(LDR_PIN);
+  if (raw < 0) return;
+
+  // simple low-pass filter to smooth flicker
+  ldrFiltered = (uint16_t)((ldrFiltered * 3 + raw) / 4);
+
+  if (ldrFiltered <= LDR_DARK_THRESHOLD) {
+    if (darkSinceMs == 0) darkSinceMs = nowMs;
+  } else if (ldrFiltered >= LDR_LIGHT_THRESHOLD) {
+    darkSinceMs = 0;
+  }
+
+  if (darkSinceMs && (nowMs - darkSinceMs >= LDR_DARK_HOLD_MS)) {
+    enterDarkSleep();
+  }
+}
+#endif
+
 // ===================== Accumulation =====================
 static int currentSlot = -1;
 static uint32_t co2Sum=0, tempSum=0, humSum=0;
-static uint16_t sampleCount=0;
+static uint16_t sampleCount=0;     // temp/hum samples
+static uint16_t co2SampleCount=0;  // CO2 samples
 
 static uint32_t bootTime=0;
 static int lastDrawnSlot=-1;
 
 static float currentCO2=NAN, currentTemp=NAN, currentHum=NAN;
+static int16_t co2OffsetPpm = 0;
+
+// ===================== AC control state =====================
+#if ENABLE_AC_HTTP
+static uint32_t acLastTickMs = 0;
+static uint32_t acLastSendMs = 0;
+#endif
 
 // Reset origins for 12h/24h pages
 static uint16_t slotsSince12hReset = 0;
@@ -140,12 +314,14 @@ static int twentyFourGraphResetOriginSlot = -1;
 
 // ===================== Timing =====================
 static uint32_t lastRedraw=0;
-static const uint32_t REDRAW_INTERVAL=20000;
+static const uint32_t REDRAW_INTERVAL=30000;
 
 static uint32_t lastSensorData=0;
 static const uint32_t SENSOR_TIMEOUT=30000;
+static const int CO2_MIN_PPM = 100;
+static const int CO2_MAX_PPM = 5000;
 
-static const uint32_t FAST_30M_REFRESH_MS = 10000;
+static const uint32_t FAST_30M_REFRESH_MS = 30000;
 static uint32_t lastFast30mDraw = 0;
 
 // ===================== FS periodic save =====================
@@ -153,6 +329,14 @@ static uint32_t lastFast30mDraw = 0;
 static bool fsReady=false;
 static uint32_t lastPeriodicSaveMs = 0;
 static const uint32_t PERIODIC_SAVE_MS = 120000; // every 2 minutes
+static bool fsSaveWarned = false;
+static uint32_t lastSaveMs = 0;
+static bool lastSaveOk = false;
+static char lastSaveName[24] = "";
+static uint32_t lastLoadMs = 0;
+static bool lastLoadOk = false;
+static char lastLoadName[24] = "";
+static bool initialDataLoaded = false;
 #endif
 
 // ===================== State =====================
@@ -168,13 +352,21 @@ static bool     timeAnchorValid   = false;
 static uint32_t nextAnchorSave    = 0;
 static const uint32_t ANCHOR_SAVE_MS = 600000;
 
+// NTP resync
+static uint32_t lastTimeSyncMs = 0;
+static const uint32_t TIME_SYNC_INTERVAL_MS = 6UL * 60UL * 60UL * 1000UL; // 6 hours
+static const uint32_t TIME_SYNC_RETRY_MS    = 60000UL; // 1 minute
+
 // ===================== Forward decls (core) =====================
 static bool initSensor();
 static void connectWiFi();
+static void initOTA();
 static void initTime();
 static bool isTimeValid();
 static void anchorTimeToNow();
 static time_t approxNow();
+static void applyTimeZone();
+static void requestTimeSync(bool waitForSync);
 
 static void resetAccumulators();
 static void commitSlotData(int slot);
@@ -195,11 +387,26 @@ static void handleDayList();
 static void handleDayData();
 static void handleStatus();
 static void handleToday();
+static void handlePowerSave();
+#if ENABLE_CO2_OFFSET_HTTP
+static void handleCo2Offset();
+#endif
+
+#if ENABLE_AC_HTTP
+static void tickAcControl();
+static void acSendEnv();
+#endif
 
 // ===================== Yield helper =====================
 static inline void yieldOften(uint16_t n){
   if ((n & 0x0F) == 0) yield();
 }
+
+
+
+
+
+
 
 // ===================== UI primitives =====================
 static uint16_t blendColor(uint16_t c1, uint16_t c2, uint8_t ratio){
@@ -217,6 +424,7 @@ static void drawCard(const Panel& p){
 
 // callbacks
 void onBtnShort() {
+  noteUserActivity(true);
   nextScreenReq = true;   // keep it minimal/safe
 }
 
@@ -243,7 +451,7 @@ static void drawModernTrendIndicator(int16_t x, int16_t y, int8_t dir, uint16_t 
   else if(dir<0) tft.fillTriangle(x, y, x+6, y, x+3, y+6, color);
 }
 
-static void drawOverlayBox(const char* title, const char* msg, uint16_t accent = COL_ACCENT) {
+static void __attribute__((unused)) drawOverlayBox(const char* title, const char* msg, uint16_t accent = COL_ACCENT) {
   const int w = SCREEN_WIDTH - 40;
   const int h = 72;
   const int x = 20;
@@ -259,7 +467,7 @@ static void drawOverlayBox(const char* title, const char* msg, uint16_t accent =
   tft.setCursor(x+10, y+42); tft.print(msg);
 }
 
-static void showToast(const char* msg, uint16_t color = COL_TEXT, uint32_t ms = 1200) {
+static void __attribute__((unused)) showToast(const char* msg, uint16_t color = COL_TEXT, uint32_t ms = 1200) {
   const int h = 22, x = 8, w = SCREEN_WIDTH - 16, y = SCREEN_HEIGHT - h - 6;
   tft.fillRoundRect(x, y, w, h, 8, COL_CARD);
   tft.drawRoundRect(x, y, w, h, 8, COL_GRID);
@@ -344,7 +552,7 @@ static void drawNowMarkerAndTag(int gx0,int gx1,int gy0,int gy1){
 }
 
 static void formatSlotTimeHHMM(int slot, char* out, size_t n){
-  int mins = slot*5;
+  int mins = slot * SLOT_MINUTES;
   int hh = (mins/60)%24;
   int mm = mins%60;
   snprintf(out,n,"%02d:%02d",hh,mm);
@@ -352,15 +560,20 @@ static void formatSlotTimeHHMM(int slot, char* out, size_t n){
 
 // ===================== Live preview into current slot =====================
 static inline void writeLiveSlotPreviewToBuffers() {
-  if (currentSlot < 0 || sampleCount == 0) return;
+  if (currentSlot < 0) return;
 
-  uint32_t avgC = co2Sum / sampleCount;
-  float    avgT = (tempSum / (float)sampleCount) / 10.0f;
-  float    avgH = (humSum  / (float)sampleCount) / 10.0f;
+  if (co2SampleCount > 0) {
+    uint32_t avgC = co2Sum / co2SampleCount;
+    if (avgC > 0 && avgC <= 65535) co2Slots[currentSlot] = (uint16_t)avgC;
+  }
 
-  if (avgC > 0 && avgC <= 65535) co2Slots[currentSlot] = (uint16_t)avgC;
-  if (!isnan(avgT)) tempSlots[currentSlot] = encodeTemp(avgT);
-  if (!isnan(avgH)) humSlots [currentSlot] = encodeHum(avgH);
+  if (sampleCount > 0) {
+    float avgT = (tempSum / (float)sampleCount) / 10.0f;
+    float avgH = (humSum  / (float)sampleCount) / 10.0f;
+
+    if (!isnan(avgT)) tempSlots[currentSlot] = encodeTemp(avgT);
+    if (!isnan(avgH)) humSlots [currentSlot] = encodeHum(avgH);
+  }
 }
 
 // ===================== Trend helpers (used by badges) =====================
@@ -508,9 +721,9 @@ static void drawSegmentedLine(const int* xs, const int* ys, int n, uint16_t line
 }
 
 // ===================== Mini graphs (30m cards) =====================
-static void drawMiniGraphU16(const Panel& p, const uint16_t* buf, uint16_t lineColor,
-                            uint16_t vminClamp, uint16_t vmaxClamp, const char* /*leftLbl*/, const char* unitLbl,
-                            float /*currentValue*/, int minutesSpan, bool /*showBadge*/)
+static void __attribute__((unused)) drawMiniGraphU16(const Panel& p, const uint16_t* buf, uint16_t lineColor,
+                             uint16_t vminClamp, uint16_t vmaxClamp, const char* /*leftLbl*/, const char* unitLbl,
+                             float /*currentValue*/, int minutesSpan, bool /*showBadge*/)
 {
   drawCard(p);
   GridRect g=gridRect(p);
@@ -574,9 +787,9 @@ static void drawMiniGraphU16(const Panel& p, const uint16_t* buf, uint16_t lineC
 static void drawMiniGraphU8(const Panel& p, const uint8_t* buf, uint16_t lineColor,
                            uint8_t vminClamp, uint8_t vmaxClamp, const char* /*leftLbl*/, const char* unitLbl,
                            float /*currentValue*/, float (*decode)(uint8_t), int minutesSpan,
-                           bool /*showBadge*/)
+                           bool /*showBadge*/, bool drawFrame = true, bool lightGrid = false, bool fillArea = false, bool markLatest = false)
 {
-  drawCard(p);
+  if (drawFrame) drawCard(p);
   GridRect g=gridRect(p);
 
   int slots = max(2, minutesSpan/5);
@@ -584,8 +797,8 @@ static void drawMiniGraphU8(const Panel& p, const uint8_t* buf, uint16_t lineCol
   int start = max(0, end-(slots-1));
   int N     = max(2, end-start+1);
 
-  float clampMin = (strcmp(unitLbl,"C")==0)?10.f:((strcmp(unitLbl,"%")==0)?20.f:(float)vminClamp);
-  float clampMax = (strcmp(unitLbl,"C")==0)?40.f:((strcmp(unitLbl,"%")==0)?80.f:(float)vmaxClamp);
+  float clampMin = (strcmp(unitLbl,"C")==0)?0.f:((strcmp(unitLbl,"%")==0)?20.f:(float)vminClamp);
+  float clampMax = (strcmp(unitLbl,"C")==0)?50.f:((strcmp(unitLbl,"%")==0)?90.f:(float)vmaxClamp);
 
   float mn=1e9f, mx=-1e9f; bool any=false;
   for(int i=start;i<=end;i++){
@@ -593,15 +806,35 @@ static void drawMiniGraphU8(const Panel& p, const uint8_t* buf, uint16_t lineCol
     float v=decode(r);
     any=true; if(v<mn) mn=v; if(v>mx) mx=v;
   }
+  if(any){
+    float span=mx-mn;
+    float pad = (strcmp(unitLbl,"%")==0)?5.0f:((strcmp(unitLbl,"C")==0)?2.0f:1.5f);
+    pad = max(pad, span*0.12f);
+    mn -= pad; mx += pad;
+    float minSpan = (strcmp(unitLbl,"%")==0)?12.0f:((strcmp(unitLbl,"C")==0)?6.0f:5.0f);
+    if((mx-mn)<minSpan){
+      float mid=(mn+mx)/2;
+      mn=mid-minSpan/2; mx=mid+minSpan/2;
+    }
+  }
+  mn=max(mn, clampMin); mx=min(mx, clampMax);
   AxisScale sc=computeAxisScale(any?mn:clampMin, any?mx:clampMax, clampMin, clampMax, 4);
 
-  drawTimeGrid12h(g.gx0,g.gx1,g.gy0,g.gy1);
+  uint16_t gridCol = lightGrid ? blendColor(COL_GRID, COL_CARD, 60) : COL_GRID;
+  if (lightGrid) {
+    for (int h : {0, 6, 12}) {
+      int x = g.gx0 + (int)((long)h*(g.gx1-g.gx0)/12L);
+      tft.drawFastVLine(x, g.gy0, g.gy1-g.gy0, gridCol);
+    }
+  } else {
+    drawTimeGrid12h(g.gx0,g.gx1,g.gy0,g.gy1);
+  }
 
   tft.setTextSize(1);
-  for(int i=0;i<sc.tickCount;i++){
-    float tv=sc.ticks[i];
+  auto drawTick=[&](int idx){
+    float tv=sc.ticks[idx];
     int y=mapValueToY(tv,g.gy0,g.gy1,sc.vmin,sc.vmax);
-    tft.drawFastHLine(g.gx0, y, (g.gx1-g.gx0), COL_GRID);
+    tft.drawFastHLine(g.gx0, y, (g.gx1-g.gx0), gridCol);
     char bufTxt[20];
     bool isInt=fabsf(sc.step-floorf(sc.step))<1e-3f;
     if(isInt) snprintf(bufTxt,sizeof(bufTxt),"%.0f%s",tv,unitLbl?unitLbl:"");
@@ -609,17 +842,36 @@ static void drawMiniGraphU8(const Panel& p, const uint8_t* buf, uint16_t lineCol
     tft.setTextColor(COL_MUTED, COL_CARD);
     tft.setCursor(p.x+2,y-4);
     tft.print(bufTxt);
+  };
+  if (lightGrid) {
+    if (sc.tickCount > 0) drawTick(0);
+    if (sc.tickCount > 2) drawTick(sc.tickCount/2);
+    if (sc.tickCount > 1) drawTick(sc.tickCount-1);
+  } else {
+    for(int i=0;i<sc.tickCount;i++){ drawTick(i); }
   }
 
   static int xs[SLOTS_PER_DAY], ys[SLOTS_PER_DAY];
   int segLen=0, lastIdx=-9999;
 
-  auto flush=[&](){ if(segLen>=2) drawSegmentedLine(xs, ys, segLen, lineColor); segLen=0; };
+  auto flush=[&](){
+    if(segLen>=2){
+      if (fillArea) {
+        uint16_t fillCol = blendColor(lineColor, COL_BG, 75);
+        for (int i=0; i<segLen; ++i) {
+          tft.drawLine(xs[i], ys[i], xs[i], g.gy1, fillCol);
+        }
+      }
+      drawSegmentedLine(xs, ys, segLen, lineColor);
+    }
+    segLen=0;
+  };
   auto pushPoint=[&](int idx, float v){
     int x=g.gx0 + ((idx - start) * (g.gx1 - g.gx0)) / (N - 1);
     int y=mapValueToY(v,g.gy0,g.gy1,sc.vmin,sc.vmax);
     xs[segLen]=x; ys[segLen]=y; segLen++;
   };
+  int lastPx=-1, lastPy=-1;
 
   for (int i=start; i<=end; ++i){
     uint8_t r=buf[i];
@@ -633,8 +885,15 @@ static void drawMiniGraphU8(const Panel& p, const uint8_t* buf, uint16_t lineCol
 #endif
     if(i!=lastIdx+1 && segLen) flush();
     pushPoint(i,v); lastIdx=i;
+    lastPx = xs[segLen-1]; lastPy = ys[segLen-1];
   }
   flush();
+
+  if (markLatest && lastPx>=0) {
+    uint16_t dotCol = blendColor(lineColor, COL_BG, 25);
+    tft.fillCircle(lastPx, lastPy, 2, dotCol);
+    tft.drawCircle(lastPx, lastPy, 3, lineColor);
+  }
 }
 
 // ===================== Floating badges on 30m page =====================
@@ -643,46 +902,72 @@ static void updateDashboardBadges() {
 
   const int contentTop = header.h + UI_TAB_H + UI_SECTION_TITLE_GAP;
   const int availH     = SCREEN_HEIGHT - (contentTop + UI_BOTTOM_MARGIN);
+  Panel mainCard = makePanel(UI_PAD_X, contentTop, SCREEN_WIDTH - 2*UI_PAD_X, availH);
 
-  int co2H    = (availH * 3) / 5;
-  int topH    = availH - co2H - UI_GUTTER;
+  const int padX = 10;
+  const int overlayX = mainCard.x + 6;
+  const int overlayY = mainCard.y + 6;
+  const int overlayH = 22;
+  const int overlayW = mainCard.w - 12;
+  uint16_t bandCol = blendColor(COL_CARD, COL_GRID, 35);
+  tft.fillRoundRect(overlayX, overlayY, overlayW, overlayH, 6, bandCol);
+  tft.drawRoundRect(overlayX, overlayY, overlayW, overlayH, 6, COL_GRID);
 
-  Panel tempCard = {UI_PAD_X, contentTop,
-                    (SCREEN_WIDTH/2) - UI_PAD_X - (UI_GUTTER/2), topH};
-  Panel humCard  = {tempCard.x + tempCard.w + UI_GUTTER, tempCard.y, tempCard.w, topH};
-  Panel co2Card  = {UI_PAD_X, contentTop + topH + UI_GUTTER,
-                    SCREEN_WIDTH - 2*UI_PAD_X, co2H};
+  tft.setTextSize(1);
+  tft.setTextColor(COL_MUTED, bandCol);
+  tft.setCursor(overlayX + 6, overlayY + 7);
+  tft.print("LIVE 30m");
 
-  const int BADGE_H = 16;
-  const int PAD_XR  = 8;
+  const int baseY = overlayY + 4;
 
-  auto badgeY  = [&](const Panel& p){ return p.y + (UI_CARD_HEADER_H / 2) - (BADGE_H / 2); };
-  auto badgeXr = [&](const Panel& p){ return p.x + p.w - PAD_XR; };
-
-  auto wipeAreaDyn = [&](const Panel& p, const char* txt){
-    int w = (int)strlen(txt) * 6 + 12;
-    if (w < 64) w = 64;
-    if (w > p.w - 20) w = p.w - 20;
-    int xr = badgeXr(p);
-    int y  = badgeY(p);
-    tft.fillRect(xr - w - 2, y - 2, w + 4, BADGE_H + 4, COL_CARD);
-  };
-
-  if (!isnan(currentCO2)) {
-    char txt[20]; snprintf(txt, sizeof(txt), "%.0f ppm", currentCO2);
-    wipeAreaDyn(co2Card, txt);
-    uint16_t col = (currentCO2 > 1200) ? COL_BAD : (currentCO2 > 800) ? COL_WARN : COL_GOOD;
-    drawModernValueBadge(badgeXr(co2Card), badgeY(co2Card), txt, col);
-  }
+  tft.setTextSize(2);
   if (!isnan(currentTemp)) {
-    char txt[20]; snprintf(txt, sizeof(txt), "%.1f C", currentTemp);
-    wipeAreaDyn(tempCard, txt);
-    drawModernValueBadge(badgeXr(tempCard), badgeY(tempCard), txt, COL_TEXT);
+    char txt[16]; snprintf(txt, sizeof(txt), "%.1fC", currentTemp);
+    tft.setTextColor(COL_TEMP, bandCol);
+    tft.setCursor(mainCard.x + padX, baseY);
+    tft.print(txt);
+    int8_t tr = u8Trend(tempSlots);
+    if (tr != 0) {
+      int16_t w = (int16_t)strlen(txt) * 6 * 2;
+      int16_t ax = mainCard.x + padX + w + 4;
+      int16_t ay = baseY + 4;
+      drawModernTrendIndicator(ax, ay, tr, (tr > 0) ? COL_WARN : COL_GOOD);
+    }
+  }
+  if (!isnan(currentCO2)) {
+    char txt[16]; snprintf(txt, sizeof(txt), "%.0f", currentCO2);
+    // Center CO2, add "ppm" label, then trend arrow
+    int16_t wNum   = (int16_t)strlen(txt) * 6 * 2;
+    int16_t wLabel = 18; // "ppm" at size 1
+    int16_t wArrow = 8;  // 6px glyph + 2px gap
+    int16_t wTotal = wNum + wLabel + wArrow;
+    int16_t x = mainCard.x + (mainCard.w - wTotal) / 2;
+    tft.setTextColor(COL_CO2, bandCol);
+    tft.setCursor(x, baseY);
+    tft.print(txt);
+    tft.setTextSize(1);
+    tft.setCursor(x + wNum, baseY + 2);
+    tft.print("ppm");
+    tft.setTextSize(2);
+    int8_t tr = co2Trend();
+    if (tr != 0) {
+      int16_t ax = x + wNum + wLabel + 2;
+      int16_t ay = baseY + 4;
+      drawModernTrendIndicator(ax, ay, tr, (tr > 0) ? COL_WARN : COL_GOOD);
+    }
   }
   if (!isnan(currentHum)) {
-    char txt[20]; snprintf(txt, sizeof(txt), "%.0f %%", currentHum);
-    wipeAreaDyn(humCard, txt);
-    drawModernValueBadge(badgeXr(humCard), badgeY(humCard), txt, COL_TEXT);
+    char txt[16]; snprintf(txt, sizeof(txt), "%.0f%%", currentHum);
+    int16_t w = (int16_t)strlen(txt) * 6 * 2;
+    tft.setTextColor(COL_HUM, bandCol);
+    tft.setCursor(mainCard.x + mainCard.w - padX - w, baseY);
+    tft.print(txt);
+    int8_t tr = u8Trend(humSlots);
+    if (tr != 0) {
+      int16_t ax = mainCard.x + mainCard.w - padX - w - 12;
+      int16_t ay = baseY + 4;
+      drawModernTrendIndicator(ax, ay, tr, (tr > 0) ? COL_WARN : COL_GOOD);
+    }
   }
 }
 
@@ -691,38 +976,20 @@ static void draw30MinDashboard() {
   const int contentTop = header.h + UI_TAB_H + UI_SECTION_TITLE_GAP;
   const int availH = SCREEN_HEIGHT - (contentTop + UI_BOTTOM_MARGIN);
 
-  int co2H    = (availH * 3) / 5;
-  int topH    = availH - co2H - UI_GUTTER;
+  Panel mainCard = makePanel(UI_PAD_X, contentTop, SCREEN_WIDTH - 2*UI_PAD_X, availH);
 
-  Panel tempCard = {UI_PAD_X, contentTop,
-                    (SCREEN_WIDTH/2) - UI_PAD_X - (UI_GUTTER/2), topH};
-  Panel humCard  = {tempCard.x + tempCard.w + UI_GUTTER, tempCard.y, tempCard.w, topH};
-  Panel co2Card  = {UI_PAD_X, contentTop + topH + UI_GUTTER,
-                    SCREEN_WIDTH - 2*UI_PAD_X, co2H};
+  // Frame
+  tft.fillRoundRect(mainCard.x+2, mainCard.y+2, mainCard.w, mainCard.h, 8, COL_GRID);
+  drawCard(mainCard);
 
-  // Temp
-  tft.fillRoundRect(tempCard.x+2, tempCard.y+2, tempCard.w, tempCard.h, 8, COL_GRID);
-  drawCard(tempCard);
-  tft.fillRect(tempCard.x, tempCard.y, tempCard.w, UI_CARD_HEADER_H, COL_TEMP);
-  tft.setTextSize(1); tft.setTextColor(COL_TEXT, COL_TEMP);
-  tft.setCursor(tempCard.x+6, tempCard.y+5); tft.print("Temp - 30m");
-  drawMiniGraphU8(tempCard, tempSlots, COL_TEMP, encodeTemp(10), encodeTemp(40), "", "C", currentTemp, decodeTemp, 36, false);
+  const int graphTop = mainCard.y + 4;
+  const int graphH = mainCard.h - 8;
+  Panel graph = makePanel(mainCard.x + 4, graphTop, mainCard.w - 8, graphH);
 
-  // Hum
-  tft.fillRoundRect(humCard.x+2, humCard.y+2, humCard.w, humCard.h, 8, COL_GRID);
-  drawCard(humCard);
-  tft.fillRect(humCard.x, humCard.y, humCard.w, UI_CARD_HEADER_H, COL_HUM);
-  tft.setTextSize(1); tft.setTextColor(COL_TEXT, COL_HUM);
-  tft.setCursor(humCard.x+6, humCard.y+5); tft.print("Humidity - 30m");
-  drawMiniGraphU8(humCard, humSlots, COL_HUM, encodeHum(20), encodeHum(80), "", "%", currentHum, decodeHum, 36, false);
-
-  // CO2
-  tft.fillRoundRect(co2Card.x+2, co2Card.y+2, co2Card.w, co2Card.h, 8, COL_GRID);
-  drawCard(co2Card);
-  tft.fillRect(co2Card.x, co2Card.y, co2Card.w, UI_CARD_HEADER_H, COL_CO2);
-  tft.setTextSize(1); tft.setTextColor(COL_TEXT, COL_CO2);
-  tft.setCursor(co2Card.x+6, co2Card.y+5); tft.print("CO2 - 30m");
-  drawMiniGraphU16(co2Card, co2Slots, COL_CO2, 300, 2000, "", "ppm", currentCO2, 36, false);
+  // base graph (temp) with frame/grid
+  drawMiniGraphU8(graph, tempSlots, COL_TEMP, encodeTemp(0), encodeTemp(100), "", "", currentTemp, decodeTemp, 36, false, false, true, true, true);
+  // overlay humidity on same axes
+  drawMiniGraphU8(graph, humSlots, COL_HUM, encodeHum(0), encodeHum(100), "", "", currentHum, decodeHum, 36, false, false, true, true, true);
 
   updateDashboardBadges();
 }
@@ -741,8 +1008,9 @@ static void drawHeader(){
   tft.fillRect(0,0,SCREEN_WIDTH,header.h,COL_CARD);
   tft.fillRect(0, header.h-4, SCREEN_WIDTH, 4, COL_ACCENT);
 
+  // Title centered
   tft.setTextSize(1); tft.setTextColor(COL_ACCENT, COL_CARD);
-  const char* title = "Environment Monitor";
+  const char* title = "Temp/Humidity";
   int16_t tw = (int)strlen(title)*6;
   tft.setCursor((SCREEN_WIDTH - tw)/2, 8); tft.print(title);
 
@@ -751,9 +1019,13 @@ static void drawHeader(){
     struct tm ti; localtime_r(&ts, &ti);
     char buf[6];
     snprintf(buf, sizeof(buf), "%02d:%02d", ti.tm_hour, ti.tm_min);
-    printRightAligned(SCREEN_WIDTH-40, 10, buf, 2, COL_TEXT, COL_CARD);
+    tft.setTextSize(2); tft.setTextColor(COL_ACCENT, COL_CARD);
+    tft.setCursor(UI_PAD_X, 6);
+    tft.print(buf);
   } else {
-    printRightAligned(SCREEN_WIDTH-40, 10, "--:--", 2, COL_MUTED, COL_CARD);
+    tft.setTextSize(2); tft.setTextColor(COL_MUTED, COL_CARD);
+    tft.setCursor(UI_PAD_X, 6);
+    tft.print("--:--");
   }
 
   if (WiFi.status() == WL_CONNECTED){
@@ -763,13 +1035,18 @@ static void drawHeader(){
   } else {
     printRightAligned(SCREEN_WIDTH-8, 12, "OFF", 1, COL_MUTED, COL_CARD);
   }
+
+  if (!isnan(batteryV)) {
+    char vb[12]; snprintf(vb, sizeof(vb), "%.2fV", batteryV);
+    printRightAligned(SCREEN_WIDTH-8, 24, vb, 1, COL_MUTED, COL_CARD);
+  }
 }
 
 static void drawTabs(){
-  static const char* names[6] = {"30m", "STATS", "CO2 24h", "T/H 24h", "CO2 12h", "T/H 12h"};
+  static const char* names[NUM_SCREENS] = {"30m", "STATS", "24h", "12h"};
   const int y = header.h + 2;
   int x = UI_PAD_X;
-  for(int i=0;i<6;i++){
+  for(int i=0;i<NUM_SCREENS;i++){
     int w = (int)strlen(names[i]) * 6 + 16;
     bool active=(i==screenMode);
     uint16_t bg = active ? COL_ACCENT : COL_CARD;
@@ -782,10 +1059,10 @@ static void drawTabs(){
 }
 
 // ---- Fullscreen CO2 24h ----
-static void drawCO2FullScreen(){
+static void __attribute__((unused)) drawCO2FullScreen(){
   const int contentTop = header.h + UI_TAB_H + UI_SECTION_TITLE_GAP;
-  Panel full={UI_PAD_X,contentTop,SCREEN_WIDTH-2*UI_PAD_X,
-              SCREEN_HEIGHT-(contentTop+UI_BOTTOM_MARGIN)};
+  Panel full = makePanel(UI_PAD_X, contentTop, SCREEN_WIDTH - 2*UI_PAD_X,
+                         SCREEN_HEIGHT - (contentTop + UI_BOTTOM_MARGIN));
 
   tft.fillRoundRect(full.x+2, full.y+2, full.w, full.h, 10, COL_GRID);
   drawCard(full);
@@ -861,7 +1138,7 @@ static void drawTempHumFullScreen(){
   const int dispStart = (twentyFourGraphResetOriginSlot >= 0) ? twentyFourGraphResetOriginSlot : 0;
 
   // Temperature card
-  Panel top={UI_PAD_X,contentTop,SCREEN_WIDTH-2*UI_PAD_X,eachH};
+  Panel top = makePanel(UI_PAD_X, contentTop, SCREEN_WIDTH - 2*UI_PAD_X, eachH);
   tft.fillRoundRect(top.x+2, top.y+2, top.w, top.h, 10, COL_GRID);
   drawCard(top);
   tft.fillRect(top.x, top.y, top.w, 20, COL_TEMP);
@@ -877,7 +1154,7 @@ static void drawTempHumFullScreen(){
     float v=decodeTemp(r);
     tany=true; if(v<tmin) tmin=v; if(v>tmax) tmax=v;
   }
-  AxisScale ts=computeAxisScale(tany?tmin:10.f, tany?tmax:40.f, 10.f, 40.f, 5);
+  AxisScale ts=computeAxisScale(tany?tmin:10.f, tany?tmax:40.f, 0.f, 50.f, 5);
 
   for(int i=0;i<ts.tickCount;i++){
     const float tv=ts.ticks[i];
@@ -923,7 +1200,7 @@ static void drawTempHumFullScreen(){
   }
 
   // Humidity card
-  Panel bot={UI_PAD_X,contentTop+eachH+UI_GUTTER,SCREEN_WIDTH-2*UI_PAD_X,eachH};
+  Panel bot = makePanel(UI_PAD_X, contentTop + eachH + UI_GUTTER, SCREEN_WIDTH - 2*UI_PAD_X, eachH);
   tft.fillRoundRect(bot.x+2, bot.y+2, bot.w, bot.h, 10, COL_GRID);
   drawCard(bot);
   tft.fillRect(bot.x, bot.y, bot.w, 20, COL_HUM);
@@ -939,7 +1216,7 @@ static void drawTempHumFullScreen(){
     float v=decodeHum(r);
     hany=true; if(v<hmin) hmin=v; if(v>hmax) hmax=v;
   }
-  AxisScale hs=computeAxisScale(hany?hmin:20.f, hany?hmax:80.f, 20.f, 80.f, 5);
+  AxisScale hs=computeAxisScale(hany?hmin:20.f, hany?hmax:80.f, 20.f, 90.f, 5);
 
   for(int i=0;i<hs.tickCount;i++){
     const float tv=hs.ticks[i];
@@ -986,10 +1263,10 @@ static void drawTempHumFullScreen(){
 }
 
 // ---- CO2 12h ----
-static void drawCO212Hour(){
+static void __attribute__((unused)) drawCO212Hour(){
   const int contentTop = header.h + UI_TAB_H + UI_SECTION_TITLE_GAP;
-  Panel half = { UI_PAD_X, contentTop, SCREEN_WIDTH - 2*UI_PAD_X,
-                 SCREEN_HEIGHT - (contentTop + UI_BOTTOM_MARGIN) };
+  Panel half = makePanel(UI_PAD_X, contentTop, SCREEN_WIDTH - 2*UI_PAD_X,
+                         SCREEN_HEIGHT - (contentTop + UI_BOTTOM_MARGIN));
 
   tft.fillRoundRect(half.x+2, half.y+2, half.w, half.h, 10, COL_GRID);
   drawCard(half);
@@ -1000,13 +1277,13 @@ static void drawCO212Hour(){
   const GridRect g = gridRect(half);
   drawTimeGrid12h(g.gx0, g.gx1, g.gy0, g.gy1);
 
-  const int baseStart = max(0, currentSlot - 143);
+  const int baseStart = max(0, currentSlot - (SLOTS_PER_12H - 1));
   int dispStart = (twelveGraphResetOriginSlot >= 0) ? max(baseStart, twelveGraphResetOriginSlot) : baseStart;
 
   int count = max(0, currentSlot - dispStart + 1);
-  if (count > 144) count = 144;
+  if (count > SLOTS_PER_12H) count = SLOTS_PER_12H;
 
-  static uint16_t buf[144];
+  static uint16_t buf[SLOTS_PER_12H];
   memset(buf, 0, sizeof(buf));
   for (int i = 0; i < count; ++i) {
     int idx = dispStart + i;
@@ -1033,7 +1310,7 @@ static void drawCO212Hour(){
     tft.print(lab);
   }
 
-  static int xs[144], ys[144];
+  static int xs[SLOTS_PER_12H], ys[SLOTS_PER_12H];
   int segLen = 0, lastIdx = -9999;
 
   auto flush = [&](){ if (segLen >= 2) drawSegmentedLine(xs, ys, segLen, COL_CO2); segLen = 0; };
@@ -1081,11 +1358,11 @@ static void drawTempHum12Hour(){
   const int availH=SCREEN_HEIGHT-(contentTop+UI_BOTTOM_MARGIN);
   const int eachH=(availH-UI_GUTTER)/2;
 
-  const int baseStart = max(0, currentSlot - 143);
+  const int baseStart = max(0, currentSlot - (SLOTS_PER_12H - 1));
   const int dispStart = (twelveGraphResetOriginSlot >= 0) ? max(baseStart, twelveGraphResetOriginSlot) : baseStart;
 
   // Temperature
-  Panel top={UI_PAD_X,contentTop,SCREEN_WIDTH-2*UI_PAD_X,eachH};
+  Panel top = makePanel(UI_PAD_X, contentTop, SCREEN_WIDTH - 2*UI_PAD_X, eachH);
   tft.fillRoundRect(top.x+2, top.y+2, top.w, top.h, 10, COL_GRID);
   drawCard(top);
   tft.fillRect(top.x, top.y, top.w, 20, COL_TEMP);
@@ -1096,9 +1373,9 @@ static void drawTempHum12Hour(){
   drawTimeGrid12h(g.gx0,g.gx1,g.gy0,g.gy1);
 
   int countT = max(0, currentSlot - dispStart + 1);
-  if (countT > 144) countT = 144;
+  if (countT > SLOTS_PER_12H) countT = SLOTS_PER_12H;
 
-  static uint8_t bufT[144];
+  static uint8_t bufT[SLOTS_PER_12H];
   memset(bufT,0,sizeof(bufT));
   for(int i=0;i<countT;i++){ int idx=dispStart+i; if(idx>=0 && idx<SLOTS_PER_DAY) bufT[i]=tempSlots[idx]; }
 
@@ -1108,9 +1385,9 @@ static void drawTempHum12Hour(){
     float v=decodeTemp(r);
     tany=true; if(v<tmin) tmin=v; if(v>tmax) tmax=v;
   }
-  AxisScale ts=computeAxisScale(tany?tmin:10.f, tany?tmax:40.f, 10.f, 40.f, 5);
+  AxisScale ts=computeAxisScale(tany?tmin:10.f, tany?tmax:40.f, 0.f, 50.f, 5);
 
-  static int xs[144], ys[144];
+  static int xs[SLOTS_PER_12H], ys[SLOTS_PER_12H];
   int segLen=0, lastIdx=-9999;
   auto flush=[&](){ if(segLen>=2) drawSegmentedLine(xs, ys, segLen, COL_TEMP); segLen=0; };
   auto push=[&](int i, float v){
@@ -1142,7 +1419,7 @@ static void drawTempHum12Hour(){
   }
 
   // Humidity
-  Panel bot={UI_PAD_X,contentTop+eachH+UI_GUTTER,SCREEN_WIDTH-2*UI_PAD_X,eachH};
+  Panel bot = makePanel(UI_PAD_X, contentTop + eachH + UI_GUTTER, SCREEN_WIDTH - 2*UI_PAD_X, eachH);
   tft.fillRoundRect(bot.x+2, bot.y+2, bot.w, bot.h, 10, COL_GRID);
   drawCard(bot);
   tft.fillRect(bot.x, bot.y, bot.w, 20, COL_HUM);
@@ -1153,9 +1430,9 @@ static void drawTempHum12Hour(){
   drawTimeGrid12h(g.gx0,g.gx1,g.gy0,g.gy1);
 
   int countH = max(0, currentSlot - dispStart + 1);
-  if (countH > 144) countH = 144;
+  if (countH > SLOTS_PER_12H) countH = SLOTS_PER_12H;
 
-  static uint8_t bufH[144];
+  static uint8_t bufH[SLOTS_PER_12H];
   memset(bufH,0,sizeof(bufH));
   for(int i=0;i<countH;i++){ int idx=dispStart+i; if(idx>=0 && idx<SLOTS_PER_DAY) bufH[i]=humSlots[idx]; }
 
@@ -1165,9 +1442,9 @@ static void drawTempHum12Hour(){
     float v=decodeHum(r);
     hany=true; if(v<hmin) hmin=v; if(v>hmax) hmax=v;
   }
-  AxisScale hs=computeAxisScale(hany?hmin:20.f, hany?hmax:80.f, 20.f, 80.f, 5);
+  AxisScale hs=computeAxisScale(hany?hmin:20.f, hany?hmax:80.f, 20.f, 90.f, 5);
 
-  static int xs2[144], ys2[144];
+  static int xs2[SLOTS_PER_12H], ys2[SLOTS_PER_12H];
   int segLen2=0; lastIdx=-9999;
   auto flush2=[&](){ if(segLen2>=2) drawSegmentedLine(xs2, ys2, segLen2, COL_HUM); segLen2=0; };
   auto push2=[&](int i, float v){
@@ -1210,19 +1487,13 @@ static void drawAllScreens() {
 
     case 1: { // STATS PAGE
       int y = header.h + UI_TAB_H + 10;
-      const int cardH = 40;
-      const int gutter = 12;
+      const int gutter  = 10;
+      const int footerH = 16;
+      const int cardArea = SCREEN_HEIGHT - y - footerH - UI_BOTTOM_MARGIN;
+      const int cardH = max(30, (cardArea - gutter) / 2);
 
       struct StatData { float sum=0; int count=0; float min=1e9f, max=-1e9f; int idxMin=-1, idxMax=-1; };
 
-      auto scanU16 = [&](StatData& s, const uint16_t* a){
-        for (int i=0;i<SLOTS_PER_DAY;i++){
-          uint16_t v=a[i]; if(!v) continue;
-          s.sum+=v; s.count++;
-          if(v<s.min){s.min=v; s.idxMin=i;}
-          if(v>s.max){s.max=v; s.idxMax=i;}
-        }
-      };
       auto scanU8 = [&](StatData& s, const uint8_t* a, float(*dec)(uint8_t)){
         for (int i=0;i<SLOTS_PER_DAY;i++){
           uint8_t r=a[i]; if(!r) continue;
@@ -1234,7 +1505,7 @@ static void drawAllScreens() {
       };
 
       auto drawStatCard = [&](const char* name, StatData d, const char* unit, bool isInt, uint16_t color, int yTop){
-        Panel p={UI_PAD_X,yTop,SCREEN_WIDTH-2*UI_PAD_X,cardH};
+        Panel p = makePanel(UI_PAD_X, yTop, SCREEN_WIDTH - 2*UI_PAD_X, cardH);
         drawCard(p);
         tft.setTextSize(1);
         tft.setTextColor(color,COL_CARD);
@@ -1271,32 +1542,28 @@ static void drawAllScreens() {
         }
       };
 
-      StatData co2,temp,hum;
-      scanU16(co2, co2Slots);
+      StatData temp, hum;
       scanU8 (temp,tempSlots,decodeTemp);
       scanU8 (hum, humSlots, decodeHum);
 
-      drawStatCard("CO2",  co2,  "ppm", true,  COL_CO2,  y); y+=cardH+gutter;
       drawStatCard("TEMP", temp, "C",   false, COL_TEMP, y); y+=cardH+gutter;
       drawStatCard("HUM",  hum,  "%",   true,  COL_HUM,  y);
 
-      int totalReadings = co2.count + temp.count + hum.count;
+      int totalReadings = temp.count + hum.count;
       tft.setTextSize(1);
       tft.setTextColor(COL_MUTED, COL_BG);
-      tft.setCursor(UI_PAD_X, SCREEN_HEIGHT-16);
+      tft.setCursor(UI_PAD_X, SCREEN_HEIGHT-footerH);
       if(totalReadings>0){
         char s[44];
-        snprintf(s,sizeof(s),"%d readings - %d%% complete", totalReadings/3, (totalReadings*100)/(SLOTS_PER_DAY*3));
+        snprintf(s,sizeof(s),"%d readings - %d%% complete", totalReadings/2, (totalReadings*100)/(SLOTS_PER_DAY*2));
         tft.print(s);
       } else {
         tft.print("No data available");
       }
     } break;
 
-    case 2: drawCO2FullScreen();       break;
-    case 3: drawTempHumFullScreen();   break;
-    case 4: drawCO212Hour();           break;
-    case 5: drawTempHum12Hour();       break;
+    case 2: drawTempHumFullScreen();   break;
+    case 3: drawTempHum12Hour();       break;
 
     default:
       screenMode = 0;
@@ -1306,18 +1573,22 @@ static void drawAllScreens() {
 }
 
 // ===================== Data accumulation =====================
-static void resetAccumulators(){ co2Sum=tempSum=humSum=0; sampleCount=0; }
+static void resetAccumulators(){ co2Sum=tempSum=humSum=0; sampleCount=0; co2SampleCount=0; }
 
 static void commitSlotData(int slot){
-  if(slot<0||slot>=SLOTS_PER_DAY||sampleCount==0) return;
+  if(slot<0||slot>=SLOTS_PER_DAY) return;
 
-  uint32_t c = co2Sum / sampleCount;
-  float t = (tempSum/(float)sampleCount)/10.0f;
-  float h = (humSum /(float)sampleCount)/10.0f;
+  if (co2SampleCount > 0) {
+    uint32_t c = co2Sum / co2SampleCount;
+    if(c>0 && c<=65535) co2Slots[slot] = (uint16_t)c;
+  }
 
-  if(c>0 && c<=65535) co2Slots[slot] = (uint16_t)c;
-  tempSlots[slot] = encodeTemp(t);
-  humSlots [slot] = encodeHum(h);
+  if (sampleCount > 0) {
+    float t = (tempSum/(float)sampleCount)/10.0f;
+    float h = (humSum /(float)sampleCount)/10.0f;
+    tempSlots[slot] = encodeTemp(t);
+    humSlots [slot] = encodeHum(h);
+  }
 }
 
 static void clearData(){
@@ -1326,40 +1597,11 @@ static void clearData(){
   memset(humSlots,0,sizeof(humSlots));
 }
 
-// ===================== SCD30 Force Recal to 400 =====================
-static uint8_t scd30_crc8(uint8_t msb, uint8_t lsb) {
-  uint8_t crc = 0xFF;
-  uint8_t data[2] = {msb, lsb};
-  for (int i = 0; i < 2; i++) {
-    crc ^= data[i];
-    for (int b = 0; b < 8; b++) {
-      crc = (crc & 0x80) ? ((crc << 1) ^ 0x31) : (crc << 1);
-    }
-  }
-  return crc;
-}
-
-static bool forceRecal400() {
-  const uint8_t SCD30_ADDR = 0x61;
-  const uint16_t ref = 400;
-  uint8_t msb = (ref >> 8) & 0xFF;
-  uint8_t lsb = (ref & 0xFF);
-  uint8_t crc = scd30_crc8(msb, lsb);
-
-  Wire.beginTransmission(SCD30_ADDR);
-  Wire.write(0x52); Wire.write(0x04);
-  Wire.write(msb);  Wire.write(lsb);
-  Wire.write(crc);
-  if (Wire.endTransmission() != 0) return false;
-  delay(50);
-  return true;
-}
-
-// ===================== Cleanly isolated NC button logic =====================
-class NcButton {
+// ===================== Cleanly isolated NO button logic =====================
+class NoButton {
 public:
-  // NC to GND + INPUT_PULLUP:
-  //  - idle LOW, press HIGH (opens)
+  // NO to GND + INPUT_PULLUP:
+  //  - idle HIGH, press LOW (closes)
   void begin(uint8_t pin,
              void (*onShortPress)(),
              void (*onLongRequest)(),
@@ -1379,7 +1621,7 @@ public:
     pinMode(_pin, INPUT_PULLUP);
 
     _instance = this;
-    attachInterrupt(digitalPinToInterrupt(_pin), isrThunk, RISING); // NC press = LOW->HIGH
+    attachInterrupt(digitalPinToInterrupt(_pin), isrThunk, FALLING); // NO press = HIGH->LOW
   }
 
   void tick(){
@@ -1394,7 +1636,7 @@ public:
       _irq = false;
 
       delay(25); // debounce settle
-      if(digitalRead(_pin) == HIGH){ // still pressed
+      if(digitalRead(_pin) == LOW){ // still pressed
         _pressed = true;
         _pressAt = millis();
         _longFired = false;
@@ -1403,7 +1645,7 @@ public:
 
     // While pressed: check for long press or release
     if(_pressed){
-      if(digitalRead(_pin) == LOW){
+      if(digitalRead(_pin) == HIGH){
         // released
         _pressed = false;
 
@@ -1423,7 +1665,7 @@ public:
       }
 
       // still pressed: long press?
-      if(!_longFired && (millis() - _pressAt >= _longMs)){
+      if(!_longFired && _longMs>0 && (_onLongReq || _onConfirm) && (millis() - _pressAt >= _longMs)){
         _longFired = true;
 
         // open confirm window
@@ -1466,31 +1708,45 @@ private:
   void (*_onConfirm)() = nullptr;
   void (*_onTimeout)() = nullptr;
 
-  static NcButton* _instance;
-  static void ICACHE_RAM_ATTR isrThunk(){
+  static NoButton* _instance;
+  static void IRAM_ATTR isrThunk(){
     if(_instance) _instance->onIRQ();
   }
 };
-NcButton* NcButton::_instance = nullptr;
+NoButton* NoButton::_instance = nullptr;
 
-static NcButton button;
+static NoButton button;
+static bool buttonReady = false;
 
-static void onBtnLongRequest(){
-  drawOverlayBox("Force 400 ppm?", "Press once within 5s to confirm");
+#if BUTTON_USE_A0
+static bool buttonA0Ready = false;
+static bool buttonA0Pressed = false;
+static uint32_t buttonA0PressAt = 0;
+static uint32_t lastButtonA0SampleMs = 0;
+static const uint16_t BUTTON_A0_PRESSED_MAX = 200;
+static const uint16_t BUTTON_A0_RELEASE_MIN = 800;
+static const uint16_t BUTTON_A0_SAMPLE_MS = 10;
+
+static void tickButtonA0(uint32_t nowMs) {
+  if (nowMs - lastButtonA0SampleMs < BUTTON_A0_SAMPLE_MS) return;
+  lastButtonA0SampleMs = nowMs;
+
+  int raw = analogRead(A0);
+  if (raw < 0) return;
+
+  if (!buttonA0Pressed) {
+    if (raw <= BUTTON_A0_PRESSED_MAX) {
+      buttonA0Pressed = true;
+      buttonA0PressAt = nowMs;
+    }
+  } else if (raw >= BUTTON_A0_RELEASE_MIN) {
+    buttonA0Pressed = false;
+    if (nowMs - buttonA0PressAt >= 20) {
+      onBtnShort();
+    }
+  }
 }
-
-static void onBtnConfirm(){
-  drawOverlayBox("Calibrating...", "Setting baseline to 400 ppm");
-  bool ok = forceRecal400();
-  showToast(ok ? "Baseline set to 400 ppm" : "Calibration failed",
-            ok ? COL_GOOD : ILI9341_RED, 1500);
-  drawAllScreens();
-}
-
-static void onBtnConfirmTimeout(){
-  showToast("Calibration canceled", COL_MUTED, 900);
-  drawAllScreens();
-}
+#endif
 
 // ===================== FS: time anchor =====================
 #if ENABLE_FS
@@ -1522,6 +1778,154 @@ static bool loadTimeAnchor() {
 }
 #endif
 
+// ===================== FS: CO2 offset =====================
+#if ENABLE_FS
+static void loadCo2OffsetFromFS() {
+  if (!fsReady || !LittleFS.exists("/co2.offset")) return;
+  File f = LittleFS.open("/co2.offset", "r");
+  if (!f) return;
+  String s = f.readStringUntil('\n');
+  f.close();
+  int v = s.toInt();
+  v = constrain(v, -500, 500);
+  co2OffsetPpm = (int16_t)v;
+}
+
+static void saveCo2OffsetToFS() {
+  if (!fsReady) return;
+  File f = LittleFS.open("/co2.offset", "w");
+  if (!f) return;
+  f.println(String((int)co2OffsetPpm));
+  f.close();
+}
+#endif
+
+// ===================== FS: power save =====================
+#if ENABLE_FS
+static const char* POWER_CFG_PATH = "/power.cfg";
+
+static void loadPowerCfgFromFS(){
+  if (!fsReady || !LittleFS.exists(POWER_CFG_PATH)) return;
+  File f = LittleFS.open(POWER_CFG_PATH, "r");
+  if (!f) return;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (!line.length() || line[0] == '#') continue;
+    int eq = line.indexOf('=');
+    if (eq < 0) continue;
+    String k = line.substring(0, eq); k.trim();
+    String v = line.substring(eq + 1); v.trim();
+    if (k == "autoOffSec") {
+      long secL = v.toInt();
+      if (secL < 0) secL = 0;
+      uint32_t sec = (uint32_t)secL;
+      if (sec > 24UL * 60UL * 60UL) sec = 24UL * 60UL * 60UL;
+      screenAutoOffMs = sec * 1000UL;
+    } else if (k == "schedEnabled") {
+      screenScheduleEnabled = (v.toInt() != 0);
+    } else if (k == "offMin") {
+      int m = v.toInt();
+      if (m < 0) m = 0;
+      if (m > 1439) m = 1439;
+      screenScheduleOffMin = (uint16_t)m;
+    } else if (k == "onMin") {
+      int m = v.toInt();
+      if (m < 0) m = 0;
+      if (m > 1439) m = 1439;
+      screenScheduleOnMin = (uint16_t)m;
+    }
+  }
+  f.close();
+}
+
+static void savePowerCfgToFS(){
+  if (!fsReady) return;
+  File f = LittleFS.open(POWER_CFG_PATH, "w");
+  if (!f) return;
+  f.println("# power settings");
+  f.print("autoOffSec=");
+  f.println(String((unsigned long)(screenAutoOffMs / 1000UL)));
+  f.print("schedEnabled=");
+  f.println(screenScheduleEnabled ? "1" : "0");
+  f.print("offMin=");
+  f.println(String((int)screenScheduleOffMin));
+  f.print("onMin=");
+  f.println(String((int)screenScheduleOnMin));
+  f.close();
+}
+#endif
+
+static bool parseTimeHHMM(const String& s, uint16_t* outMin){
+  if (!outMin) return false;
+  int colon = s.indexOf(':');
+  if (colon <= 0 || colon >= (int)s.length() - 1) return false;
+  int h = 0;
+  int m = 0;
+  for (int i = 0; i < colon; ++i) {
+    char c = s[i];
+    if (!isDigit(c)) return false;
+    h = h * 10 + (c - '0');
+  }
+  for (int i = colon + 1; i < (int)s.length(); ++i) {
+    char c = s[i];
+    if (!isDigit(c)) return false;
+    m = m * 10 + (c - '0');
+  }
+  if (h < 0 || h > 23 || m < 0 || m > 59) return false;
+  *outMin = (uint16_t)(h * 60 + m);
+  return true;
+}
+
+static bool isScheduleActive(){
+  if (!screenScheduleEnabled) return false;
+  if (screenScheduleOffMin == screenScheduleOnMin) return false;
+  time_t ts = approxNow();
+  if (ts <= 0) return false;
+  struct tm ti;
+  localtime_r(&ts, &ti);
+  int curMin = ti.tm_hour * 60 + ti.tm_min;
+  if (screenScheduleOffMin < screenScheduleOnMin) {
+    return curMin >= screenScheduleOffMin && curMin < screenScheduleOnMin;
+  }
+  return curMin >= screenScheduleOffMin || curMin < screenScheduleOnMin;
+}
+
+static void applyScheduleState(){
+  const bool active = isScheduleActive();
+  if (active) {
+    if (screenScheduleOverride) {
+      if (screenOffBySchedule) {
+        screenOffBySchedule = false;
+        if (!screenOffForced && !screenOffByAuto) {
+          screenOff = false;
+          applyBacklightOutput();
+          screenWakeReq = true;
+        }
+      }
+      return;
+    }
+    if (!screenOffBySchedule) {
+      screenOffBySchedule = true;
+      screenOff = true;
+      screenOffByAuto = false;
+      applyBacklightOutput();
+    }
+    return;
+  }
+  if (screenScheduleOverride) {
+    screenScheduleOverride = false;
+  }
+  if (screenOffBySchedule) {
+    screenOffBySchedule = false;
+    if (!screenOffForced && !screenOffByAuto) {
+      screenOff = false;
+      applyBacklightOutput();
+      screenWakeReq = true;
+    }
+  }
+}
+
 // ===================== FS: per-day files =====================
 #if ENABLE_FS
 struct StorageHeader{
@@ -1539,10 +1943,14 @@ static void pruneOldDayFiles() {
 
   Dir dir = LittleFS.openDir("/");
   while (dir.next()) {
-    String fn = dir.fileName();   // "/day_YYYYDDD.bin"
-    if (!fn.startsWith("/day_") || !fn.endsWith(".bin")) continue;
+    String fn = dir.fileName();   // may be "day_YYYYDDD.bin" or "/day_YYYYDDD.bin"
+    const char* base = fn.c_str();
+    if (base[0] == '/') base++;
+    size_t len = strlen(base);
+    if (len < 8 || strncmp(base, "day_", 4) != 0 || strcmp(base + len - 4, ".bin") != 0) continue;
     if (count < MAX_FILES) {
-      strncpy(names[count], fn.c_str(), sizeof(names[count]) - 1);
+      names[count][0] = '/';
+      strncpy(names[count] + 1, base, sizeof(names[count]) - 2);
       names[count][sizeof(names[count]) - 1] = '\0';
       count++;
     }
@@ -1565,16 +1973,28 @@ static void pruneOldDayFiles() {
 static void saveDataToFS(bool previousDay) {
   if (!fsReady) return;
 
+  lastSaveOk = false;
+  lastSaveName[0] = '\0';
+
   writeLiveSlotPreviewToBuffers();
 
   time_t ts = approxNow();
-  if (ts <= 1600000000) return;
-  if (previousDay) ts -= 4 * 3600;
+  bool timeOk = ts > 1600000000;
+  if (timeOk && previousDay) ts -= 4 * 3600;
 
-  struct tm ti;
-  localtime_r(&ts, &ti);
-  uint16_t year = 1900 + ti.tm_year;
-  uint16_t day1 = ti.tm_yday + 1;
+  uint16_t year = 0;
+  uint16_t day1 = 1;
+
+  if (timeOk) {
+    struct tm ti;
+    localtime_r(&ts, &ti);
+    year = 1900 + ti.tm_year;
+    day1 = ti.tm_yday + 1;
+  } else {
+    // Offline fallback: derive a pseudo day index from uptime so we still persist across reboots
+    uint32_t pseudoDay = softStartTime ? ((millis() - softStartTime) / 86400000UL) : 0;
+    day1 = 1 + (pseudoDay % 366);
+  }
 
   char path[24];
   snprintf(path, sizeof(path), "/day_%04u%03u.bin", (unsigned)year, (unsigned)day1);
@@ -1587,7 +2007,18 @@ static void saveDataToFS(bool previousDay) {
   for (size_t i = 0; i < sizeof(co2Slots); ++i) h.checksum += ((uint8_t*)co2Slots)[i];
 
   File f = LittleFS.open(path, "w");
-  if (!f) return;
+  if (!f) {
+    if (!fsSaveWarned) {
+      Serial.printf("FS save open failed for %s\n", path);
+      fsSaveWarned = true;
+    }
+    return;
+  }
+  fsSaveWarned = false;
+  lastSaveOk = true;
+  lastSaveMs = millis();
+  strncpy(lastSaveName, path+1, sizeof(lastSaveName)-1); // skip '/'
+  lastSaveName[sizeof(lastSaveName)-1] = '\0';
 
   f.write((uint8_t*)&h, sizeof(h));
   f.write((uint8_t*)co2Slots, sizeof(co2Slots));
@@ -1624,12 +2055,19 @@ static bool loadDayFile(const char* path){
     f.close(); return false;
   }
   f.close();
+  lastLoadOk = true;
+  lastLoadMs = millis();
+  strncpy(lastLoadName, path[0] == '/' ? path + 1 : path, sizeof(lastLoadName) - 1);
+  lastLoadName[sizeof(lastLoadName) - 1] = '\0';
+  initialDataLoaded = true;
   return true;
 }
 
 // Load today's file if time valid; else load newest file.
 static void loadDataFromFS() {
   if (!fsReady) return;
+  lastLoadOk = false;
+  lastLoadName[0] = '\0';
 
   if (isTimeValid()) {
     time_t ts = time(nullptr);
@@ -1646,8 +2084,7 @@ static void loadDataFromFS() {
       if (loadDayFile(path)) return;
     }
 
-    clearData(); // time valid but no file: start clean
-    return;
+    // time valid but no file for today: fall back to newest saved file so graphs survive reboot
   }
 
   char newest[24] = {0};
@@ -1656,14 +2093,27 @@ static void loadDataFromFS() {
   Dir dir = LittleFS.openDir("/");
   while (dir.next()) {
     String fn = dir.fileName();
-    if (!fn.startsWith("/day_") || !fn.endsWith(".bin")) continue;
-    if (!found || fn.compareTo(String(newest)) > 0) {
-      strncpy(newest, fn.c_str(), sizeof(newest)-1);
+    const char* base = fn.c_str();
+    if (base[0] == '/') base++;
+    size_t len = strlen(base);
+    if (len < 8 || strncmp(base, "day_", 4) != 0 || strcmp(base + len - 4, ".bin") != 0) continue;
+
+    char cand[24];
+    cand[0] = '/';
+    strncpy(cand + 1, base, sizeof(cand) - 2);
+    cand[sizeof(cand) - 1] = '\0';
+    if (!found || strcmp(cand, newest) > 0) {
+      strncpy(newest, cand, sizeof(newest)-1);
       newest[sizeof(newest)-1] = '\0';
       found = true;
     }
   }
-  if (found) loadDayFile(newest);
+  if (found) {
+    if (!loadDayFile(newest)) clearData();
+  } else {
+    clearData();
+  }
+  initialDataLoaded = true;
 }
 #endif // ENABLE_FS
 
@@ -1687,35 +2137,63 @@ static time_t approxNow() {
   return 0;
 }
 
+static void applyTimeZone() {
+  setenv("TZ", TZ_ADELAIDE, 1);
+  tzset();
+}
+
+static void requestTimeSync(bool waitForSync) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  configTime(TZ_ADELAIDE, "au.pool.ntp.org", "time.google.com", "time.windows.com");
+  applyTimeZone();
+
+  if (!waitForSync) return;
+  uint32_t t0 = millis();
+  while (time(nullptr) <= 1600000000 && millis() - t0 < 12000) {
+    delay(200);
+    yield();
+  }
+}
+
 // ===================== Sensor init =====================
 static bool initSensor() {
   Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.setClock(100000);
-  delay(50);
-
-  for (int i = 0; i < 3; i++) {
-    if (scd30.begin()) {
-      scd30.setMeasurementInterval(5);
-      scd30.setTemperatureOffset(0);
-      scd30.selfCalibrationEnabled(SCD30_ASC ? true : false);
-      lastSensorData = millis();
-      return true;
-    }
-    delay(250);
+  if (!scd30.begin()) {
+    Serial.println("SCD30: begin failed");
+    return false;
   }
-  return false;
+#if SCD30_ASC
+  scd30.selfCalibrationEnabled(true);
+#else
+  scd30.selfCalibrationEnabled(false);
+#endif
+  scd30.setMeasurementInterval(2); // seconds (min 2)
+  lastSensorData = millis();
+  return true;
 }
 
 // ===================== Network / Time =====================
 static void connectWiFi() {
   WiFi.mode(WIFI_STA);
-  WiFi.hostname("envmonitor");
+  WiFi.hostname(OTA_HOSTNAME);
 
   WiFiManager wm;
   wm.setConfigPortalTimeout(120);
   wm.setConfigPortalBlocking(true);
 
-  bool ok = wm.autoConnect("EnvMonitor-Setup");
+  bool ok = false;
+  if (DEFAULT_WIFI_SSID[0] != '\0') {
+    WiFi.begin(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASS);
+    uint32_t startMs = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - startMs) < 8000) {
+      delay(200);
+      yield();
+    }
+    ok = (WiFi.status() == WL_CONNECTED);
+  }
+  if (!ok) {
+    ok = wm.autoConnect("EnvMonitor-Setup");
+  }
 
   if (!ok) {
     Serial.println("WiFiManager: failed or timed out -> offline mode");
@@ -1728,8 +2206,10 @@ static void connectWiFi() {
     Serial.println(WiFi.localIP());
     offlineMode = false;
 
-    if (MDNS.begin("envmonitor")) {
-      Serial.println("mDNS responder started: http://envmonitor.local");
+    if (MDNS.begin(OTA_HOSTNAME)) {
+      Serial.print("mDNS responder started: http://");
+      Serial.print(OTA_HOSTNAME);
+      Serial.println(".local");
       MDNS.addService("http", "tcp", 80);
     } else {
       Serial.println("mDNS responder FAILED");
@@ -1737,21 +2217,48 @@ static void connectWiFi() {
   }
 }
 
+#if ENABLE_OTA
+static void initOTA() {
+  if (offlineMode || WiFi.status() != WL_CONNECTED) return;
+
+  ArduinoOTA.setPort(OTA_PORT);
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+#ifdef OTA_PASSWORD
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+#endif
+
+  ArduinoOTA.onStart([]() {
+    Serial.println("OTA: start");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("OTA: end");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    if (total == 0) return;
+    Serial.printf("OTA: %u%%\n", (progress * 100U) / total);
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA: error[%u]\n", (unsigned)error);
+  });
+
+  ArduinoOTA.begin();
+  Serial.printf("OTA ready: %s:%u\n", OTA_HOSTNAME, (unsigned)OTA_PORT);
+}
+#else
+static void initOTA() {}
+#endif
+
 static void initTime() {
+  // Ensure TZ is applied even before/without NTP sync.
+  applyTimeZone();
   if (!offlineMode) {
-    configTime(TZ_ADELAIDE, "au.pool.ntp.org", "time.google.com", "time.windows.com");
-    uint32_t t0 = millis();
-    while (time(nullptr) <= 1600000000 && millis() - t0 < 12000) {
-      delay(200);
-      yield();
-    }
+    requestTimeSync(true);
     if (time(nullptr) <= 1600000000) {
       offlineMode = true;
       softStartTime = millis();
     }
   } else {
-    setenv("TZ", TZ_ADELAIDE, 1);
-    tzset();
+    applyTimeZone();
   }
 
   anchorTimeToNow();
@@ -1771,67 +2278,131 @@ static const char WEB_ROOT_HTML[] PROGMEM = R"HTML(
 <title>Environment Monitor</title>
 <style>
 :root{
-  --bg:#0b1020;--panel:#10172c;--text:#eaf0ff;--muted:rgba(234,240,255,.72);
+  --bg:#0a1117;--panel:#0f1c26;--panel-2:#122433;--text:#e9f3ff;--muted:rgba(233,243,255,.70);
   --grid:rgba(255,255,255,.10);--stroke:rgba(255,255,255,.12);--btn:rgba(255,255,255,.06);
-  --accent:#fad24f;--co2:#ff785a;--temp:#50d2ff;--hum:#8cb4ff;--r:16px;
+  --accent:#f4c44e;--accent-2:#e48a4d;--co2:#ff7a59;--temp:#4dd6ff;--hum:#9fc0ff;
+  --good:#7cd7a8;--warn:#f0c35b;--bad:#f05a5a;--r:18px;
 }
 [data-theme="light"]{
-  --bg:#f6f7fb;--panel:#ffffff;--text:#0f1625;--muted:rgba(15,22,37,.62);
-  --grid:rgba(15,22,37,.10);--stroke:rgba(15,22,37,.12);--btn:rgba(15,22,37,.06);
-  --accent:#aa7d00;
+  --bg:#f4f2ee;--panel:#ffffff;--panel-2:#f7f7fb;--text:#131a23;--muted:rgba(19,26,35,.62);
+  --grid:rgba(19,26,35,.10);--stroke:rgba(19,26,35,.12);--btn:rgba(19,26,35,.06);
+  --accent:#b47a00;--accent-2:#c95b2b;
 }
 *{box-sizing:border-box}html,body{height:100%}
-body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--text)}
-.wrap{max-width:1100px;margin:0 auto;padding:12px}
+body{
+  margin:0;
+  font-family:"Space Grotesk","Rubik","Outfit","Segoe UI",sans-serif;
+  background:
+    radial-gradient(1200px 520px at 20% -10%, rgba(255,210,110,.12), transparent 60%),
+    radial-gradient(900px 420px at 90% -20%, rgba(77,214,255,.10), transparent 60%),
+    var(--bg);
+  color:var(--text);
+}
+body::before{
+  content:"";position:fixed;inset:0;pointer-events:none;z-index:-1;
+  background-image:
+    linear-gradient(135deg, rgba(255,255,255,.03) 0, rgba(255,255,255,0) 60%),
+    radial-gradient(1px 1px at 18px 18px, rgba(255,255,255,.07) 0, rgba(255,255,255,0) 1px);
+  background-size:100% 100%, 24px 24px;
+  opacity:.45;
+}
+.wrap{max-width:1180px;margin:0 auto;padding:14px}
 .top{
-  position:sticky;top:0;z-index:5;padding:10px 0;background:linear-gradient(180deg,var(--bg),rgba(0,0,0,0));
+  position:sticky;top:0;z-index:5;padding:10px 0;
+  background:linear-gradient(180deg, var(--bg), rgba(0,0,0,0));
   backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)
 }
 .head{
-  border:1px solid var(--stroke);border-radius:var(--r);background:rgba(255,255,255,.04);
-  padding:12px;display:flex;gap:10px;align-items:center;justify-content:space-between
+  border:1px solid var(--stroke);border-radius:var(--r);
+  background:linear-gradient(135deg, rgba(255,255,255,.06), rgba(255,255,255,.02));
+  padding:14px 16px;display:flex;gap:12px;align-items:center;justify-content:space-between
 }
-.h1{display:flex;flex-direction:column;gap:2px}
-.h1 b{font-size:1.05rem} .h1 span{color:var(--muted);font-size:.9rem}
-.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:flex-end}
-.card{border:1px solid var(--stroke);border-radius:var(--r);background:rgba(255,255,255,.04);padding:12px;margin-top:10px}
-.controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.h1{display:flex;flex-direction:column;gap:4px}
+.h1 b{font-size:1.2rem;letter-spacing:.3px}
+.h1 span{color:var(--muted);font-size:.9rem}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:flex-end}
+.card{
+  border:1px solid var(--stroke);border-radius:var(--r);
+  background:linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02));
+  padding:14px;margin-top:12px;box-shadow:0 6px 24px rgba(0,0,0,.18)
+}
+.hero{
+  display:grid;grid-template-columns:1.1fr 1.4fr;gap:12px;align-items:stretch;
+  border:1px solid var(--stroke);border-radius:var(--r);
+  background:linear-gradient(110deg, rgba(244,196,78,.08), rgba(77,214,255,.06));
+  padding:14px;margin-top:10px
+}
+.hero .meta{
+  padding:10px 10px 10px 12px;border-radius:14px;background:rgba(0,0,0,.18);
+  border:1px solid var(--stroke)
+}
+.hero .meta .k{font-size:.85rem;color:var(--muted);letter-spacing:.3px}
+.hero .meta .v{font-size:1.6rem;font-weight:700;margin-top:6px}
+.livegrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+.livecard{
+  border:1px solid var(--stroke);border-radius:14px;padding:12px;
+  background:linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02));
+  min-height:74px;display:flex;flex-direction:column;justify-content:space-between
+}
+.livecard .k{font-size:.8rem;color:var(--muted)}
+.livecard .v{font-size:1.4rem;font-weight:700}
+.livecard.co2{outline:1px solid rgba(255,122,89,.25)}
+.livecard.temp{outline:1px solid rgba(77,214,255,.25)}
+.livecard.hum{outline:1px solid rgba(159,192,255,.25)}
+.trend{display:inline-block;min-width:12px;text-align:center;margin-left:6px;font-size:.95em;opacity:.9}
+.trend.up{color:var(--warn)}
+.trend.down{color:var(--good)}
+.trend.flat{color:var(--muted)}
+.controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.controls.stack{flex-direction:column;align-items:stretch;gap:10px}
+.controls.stack .bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.controls.stack .bar .group{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.controls.stack.control-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.controls.stack.control-grid .bar{min-height:40px}
+.controls.stack.control-grid .bar.full{grid-column:1/-1}
+@media(max-width:900px){.controls.stack.control-grid{grid-template-columns:1fr}}
 .controls.scroll{
-  flex-wrap:nowrap;
-  overflow-x:auto;
-  -webkit-overflow-scrolling:touch;
-  scrollbar-width:none;
-  scroll-snap-type:x mandatory;
+  flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;
+  scrollbar-width:none;scroll-snap-type:x mandatory;
 }
 .controls.scroll::-webkit-scrollbar{display:none}
 .controls.scroll > *{scroll-snap-align:start}
 .sp{flex:1}
-button,select,label{font:inherit}
-button,select{
-  height:34px;border-radius:999px;border:1px solid var(--stroke);background:var(--btn);color:var(--text);
-  padding:0 11px;cursor:pointer;touch-action:manipulation
+button,select,input[type=time],label{font:inherit}
+button,select,input[type=time]{
+  height:36px;border-radius:999px;border:1px solid var(--stroke);background:var(--btn);color:var(--text);
+  padding:0 14px;cursor:pointer;touch-action:manipulation;transition:transform .12s ease, background .12s ease
 }
+button:hover{background:rgba(255,255,255,.10)}
 button:active{transform:translateY(1px)}
 select{min-width:220px}
 @media(max-width:720px){select{min-width:170px}}
-.pill{padding:0 10px}
+.pill{padding:0 12px}
 .chip{
-  display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;
+  display:inline-flex;align-items:center;gap:8px;padding:7px 12px;border-radius:999px;
   border:1px solid var(--stroke);background:rgba(0,0,0,.14);color:var(--text);user-select:none
+}
+.range{display:inline-flex;align-items:center;gap:10px;padding-right:12px}
+.range input[type=range]{width:140px;accent-color:var(--accent)}
+.range.tight input[type=range]{width:90px}
+.range .val{min-width:16px;text-align:right;font-variant-numeric:tabular-nums;opacity:.8}
+.chip.time input[type=time]{
+  height:28px;border-radius:10px;border:1px solid var(--stroke);background:rgba(0,0,0,.16);color:var(--text);
+  padding:0 8px
 }
 .chip.stale{opacity:.55}
 .dot{width:10px;height:10px;border-radius:50%}
-.dot.co2{background:var(--co2)}.dot.t{background:var(--temp)}.dot.h{background:var(--hum)}
+.dot.co2{background:var(--co2)}.dot.t{background:var(--temp)}.dot.h{background:var(--hum)}.dot.batt{background:#9ff770}
 canvas{
-  width:100%;height:420px;display:block;border-radius:14px;border:1px solid var(--stroke);
-  background:rgba(0,0,0,.12);
+  width:100%;height:440px;display:block;border-radius:16px;border:1px solid var(--stroke);
+  background:linear-gradient(180deg, rgba(0,0,0,.16), rgba(0,0,0,.08));
   touch-action:none; /* important for pan/pinch */
 }
 @media(max-width:720px){canvas{height:320px}}
 .small{color:var(--muted);font-size:.9rem}
 .grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
 @media(max-width:860px){.grid3{grid-template-columns:1fr}}
-.stat{border:1px solid var(--stroke);border-radius:14px;background:rgba(0,0,0,.10);padding:10px}
+.stat{border:1px solid var(--stroke);border-radius:14px;background:rgba(0,0,0,.10);padding:12px}
 .stat .k{color:var(--muted);font-size:.85rem;margin-bottom:4px}
 .stat .v{font-weight:800}
 #tip{
@@ -1839,23 +2410,22 @@ canvas{
   background:rgba(8,10,22,.92);color:var(--text);border:1px solid rgba(255,255,255,.18);
   padding:7px 10px;border-radius:12px;font-size:.86rem
 }
+.fade-in{animation:fadeIn .5s ease both}
+@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
 
 /* --- mobile comfort --- */
+@media(max-width:900px){
+  .hero{grid-template-columns:1fr}
+}
 @media(max-width:720px){
   .wrap{padding:10px}
   .head{padding:10px}
   .card{padding:10px}
-  button,select{
-    height:42px;
-    padding:0 14px;
-    font-size:15px;
+  button,select,input[type=time]{
+    height:42px;padding:0 14px;font-size:15px;
   }
   .pill{padding:0 14px}
-  select{
-    min-width:0;
-    max-width:100%;
-    flex:1 1 auto;
-  }
+  select{min-width:0;max-width:100%;flex:1 1 auto}
   .small{font-size:.86rem}
 }
 @media(max-width:420px){
@@ -1864,40 +2434,78 @@ canvas{
 }
 </style></head><body><div class="wrap">
 <div class="top"><div class="head">
-  <div class="h1"><b>Environment Monitor</b><span>Live + History · ACST/ACDT</span></div>
+  <div class="h1"><b>Environment Monitor</b><span>Live + History - ACST/ACDT</span></div>
   <div class="row">
-    <button id="btnTheme" title="Toggle theme">🌓</button>
-    <button id="btnPNG" title="Export PNG">📷</button>
+    <div class="chip" id="battChip"><span class="dot batt"></span><span id="batt">-- V</span></div>
+    <button id="btnTheme" title="Toggle theme">Theme</button>
+    <button id="btnPNG" title="Export PNG">PNG</button>
   </div>
 </div></div>
 
-<div class="card">
-  <div class="controls scroll">
-    <button class="pill" id="prev">◀</button>
-    <button class="pill" id="next">▶</button>
-    <select id="day"></select>
-    <label class="chip"><input id="smooth" type="checkbox" checked style="accent-color:var(--accent)"> Smooth</label>
-    <select id="mode" style="min-width:150px">
-      <option value="line">CO₂ Line</option>
-      <option value="area">CO₂ Area</option>
-      <option value="bar">CO₂ Bars</option>
-    </select>
-    <button class="pill" data-r="6h">6h</button>
-    <button class="pill" data-r="12h">12h</button>
-    <button class="pill" data-r="24h">24h</button>
-    <button class="pill" data-r="all">All</button>
-    <div class="sp"></div>
-    <div class="chip" id="liveChip"><span class="dot co2"></span><span id="live">Live: --</span></div>
+<div class="hero fade-in">
+  <div class="meta">
+    <div class="k">Live Environment</div>
+    <div class="v" id="liveHero">--</div>
+    <div class="small" id="liveMeta">Updated just now</div>
+  </div>
+  <div class="livegrid">
+    <div class="livecard co2"><div class="k">CO2</div><div class="v" id="liveCo2">-- ppm <span class="trend flat" id="liveCo2Trend">-</span></div></div>
+    <div class="livecard temp"><div class="k">Temperature</div><div class="v" id="liveTemp">-- C <span class="trend flat" id="liveTempTrend">-</span></div></div>
+    <div class="livecard hum"><div class="k">Humidity</div><div class="v" id="liveHum">-- % <span class="trend flat" id="liveHumTrend">-</span></div></div>
   </div>
 </div>
 
-<div class="card">
+<div class="card fade-in">
+  <div class="controls stack control-grid">
+    <div class="bar">
+      <div class="group">
+        <button class="pill" id="prev">Prev</button>
+        <button class="pill" id="next">Next</button>
+        <select id="day"></select>
+      </div>
+    </div>
+    <div class="bar">
+      <div class="group">
+        <label class="chip"><input id="smooth" type="checkbox" checked style="accent-color:var(--accent)"> Smooth</label>
+        <label class="chip range tight" title="Smoothing strength">
+          <span>Smoothness</span><input id="smoothAmt" type="range" min="1" max="6" step="1" value="3"><span class="val" id="smoothAmtVal">3</span>
+        </label>
+        <select id="mode" style="min-width:150px">
+          <option value="line">CO2 Line</option>
+          <option value="area">CO2 Area</option>
+          <option value="bar">CO2 Bars</option>
+        </select>
+        <button class="pill" data-r="6h">6h</button>
+        <button class="pill" data-r="12h">12h</button>
+        <button class="pill" data-r="24h">24h</button>
+        <button class="pill" data-r="all">All</button>
+      </div>
+    </div>
+    <div class="bar full">
+      <div class="chip" id="liveChip"><span class="dot co2"></span><span id="live">Live: --</span></div>
+      <div class="sp"></div>
+      <label class="chip range" title="TFT brightness"><span>Brightness</span><input id="br" type="range" min="5" max="100" value="90"></label>
+      <button class="pill" id="scr" title="Toggle screen on/off">Screen: On</button>
+    </div>
+    <div class="bar full">
+      <label class="chip" title="Enable daily screen schedule">
+        <input id="schedOn" type="checkbox" style="accent-color:var(--accent)"> Schedule
+      </label>
+      <label class="chip time" title="Screen off time">
+        <span>Off</span><input id="offAt" type="time" value="22:00" step="60">
+      </label>
+      <label class="chip time" title="Screen on time">
+        <span>On</span><input id="onAt" type="time" value="06:30" step="60">
+      </label>
+    </div>
+  </div>
+</div><div class="card">
   <div class="controls scroll">
-    <label class="chip"><input id="cOn" type="checkbox" checked style="accent-color:var(--co2)"><span class="dot co2"></span>CO₂</label>
+    <label class="chip"><input id="cOn" type="checkbox" checked style="accent-color:var(--co2)"><span class="dot co2"></span>CO2�</label>
     <label class="chip"><input id="tOn" type="checkbox" checked style="accent-color:var(--temp)"><span class="dot t"></span>Temp</label>
     <label class="chip"><input id="hOn" type="checkbox" checked style="accent-color:var(--hum)"><span class="dot h"></span>Hum</label>
     <div class="sp"></div>
-    <div class="small" id="hint">Hover: tooltip · Click: lock · Wheel: zoom</div>
+    <div class="small" id="hint">Hover: tooltip - Click: lock - Wheel: zoom</div>
   </div>
   <div style="margin-top:10px"><canvas id="cv"></canvas></div>
 </div>
@@ -1906,12 +2514,12 @@ canvas{
   <div class="controls" style="margin-bottom:8px">
     <b id="stTitle">Stats</b>
     <div class="sp"></div>
-    <span class="small" id="stInfo">Samples —</span>
+    <span class="small" id="stInfo">Samples --</span>
   </div>
   <div class="grid3">
-    <div class="stat"><div class="k">CO₂</div><div class="v" id="sC">Avg —</div><div class="small" id="rC">Min — · Max —</div></div>
-    <div class="stat"><div class="k">Temp</div><div class="v" id="sT">Avg —</div><div class="small" id="rT">Min — · Max —</div></div>
-    <div class="stat"><div class="k">Humidity</div><div class="v" id="sH">Avg —</div><div class="small" id="rH">Min — · Max —</div></div>
+    <div class="stat"><div class="k">CO2�</div><div class="v" id="sC">Avg --</div><div class="small" id="rC">Min -- - Max --</div></div>
+    <div class="stat"><div class="k">Temp</div><div class="v" id="sT">Avg --</div><div class="small" id="rT">Min -- - Max --</div></div>
+    <div class="stat"><div class="k">Humidity</div><div class="v" id="sH">Avg --</div><div class="small" id="rH">Min -- - Max --</div></div>
   </div>
 </div>
 
@@ -1925,17 +2533,61 @@ canvas{
   const LS={g:(k,d)=>{try{const v=localStorage.getItem(k);return v==null?d:JSON.parse(v)}catch(e){return d}},
             s:(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}};
 
-  const sel=$("day"), cv=$("cv"), ctx=cv.getContext("2d"), tip=$("tip");
-  const liveEl=$("live"), liveChip=$("liveChip");
-  const smoothEl=$("smooth"), modeEl=$("mode"), cOn=$("cOn"), tOn=$("tOn"), hOn=$("hOn");
+  const sel=$("day"), cv=$("cv"), ctx=cv.getContext("2d"), tip=$("tip"), br=$("br");
+  const scrBtn=$("scr"), autoOff=$("autoOff"), schedOn=$("schedOn"), offAt=$("offAt"), onAt=$("onAt");
+  const liveEl=$("live"), liveChip=$("liveChip"), battEl=$("batt"), battChip=$("battChip"), liveHero=$("liveHero"), liveMeta=$("liveMeta"), liveCo2=$("liveCo2"), liveTemp=$("liveTemp"), liveHum=$("liveHum"), liveCo2Trend=$("liveCo2Trend"), liveTempTrend=$("liveTempTrend"), liveHumTrend=$("liveHumTrend");
+  const smoothEl=$("smooth"), smoothAmt=$("smoothAmt"), smoothAmtVal=$("smoothAmtVal");
+  const modeEl=$("mode"), cOn=$("cOn"), tOn=$("tOn"), hOn=$("hOn");
 
   let dayList=[], data=null, lastStatusT=0;
+  let statusSlot=null;
   let viewMin=0, viewMax=0;
   let DPR=1, cssW=800, cssH=360;
   let hover=null, locked=false, lastPX=0, lastPY=0;
+  let brTimer=null;
+  let drawQueued=false;
+  let themeCache=null;
+  let dataVer=0;
+  let smoothCacheKey="";
+  let co2Sm=null, ttSm=null, hhSm=null;
+  let viewCacheKey="";
+  let viewCache=null;
+  let lastTodayFetchT=0;
+  let lastTodaySlot=null;
+  let screenIsOff=false;
 
-  function setTheme(th){ document.documentElement.dataset.theme=th; LS.s("theme",th); draw(); }
+  let prevCo2=null, prevTemp=null, prevHum=null;
+
+  function setTrend(el, dir){
+    if (!el) return;
+    el.classList.remove("up","down","flat");
+    if (dir>0){ el.classList.add("up"); el.textContent = "^"; }
+    else if (dir<0){ el.classList.add("down"); el.textContent = "v"; }
+    else { el.classList.add("flat"); el.textContent = "-"; }
+  }
+
+
+  function scheduleDraw(){
+    if(drawQueued) return;
+    drawQueued=true;
+    requestAnimationFrame(()=>{ drawQueued=false; draw(); });
+  }
+
+  function setTheme(th){ document.documentElement.dataset.theme=th; LS.s("theme",th); themeCache=null; scheduleDraw(); }
   $("btnTheme").onclick=()=>setTheme((document.documentElement.dataset.theme==="light")?"dark":"light");
+
+  function getThemeColors(){
+    if(themeCache) return themeCache;
+    const cs=getComputedStyle(document.documentElement);
+    themeCache={
+      panel: cs.getPropertyValue("--panel").trim()||"#10172c",
+      grid:  cs.getPropertyValue("--grid").trim() ||"rgba(255,255,255,.10)",
+      stroke:cs.getPropertyValue("--stroke").trim()||"rgba(255,255,255,.12)",
+      muted: cs.getPropertyValue("--muted").trim()||"rgba(234,240,255,.72)",
+      accent:cs.getPropertyValue("--accent").trim()||"#fad24f",
+    };
+    return themeCache;
+  }
 
   function toRGBA(hex,a){
     const r=parseInt(hex.slice(1,3),16), g=parseInt(hex.slice(3,5),16), b=parseInt(hex.slice(5,7),16);
@@ -1945,23 +2597,115 @@ canvas{
     const m=(i|0)*(stepMin||5), hh=Math.floor(m/60)%24, mm=m%60;
     return String(hh).padStart(2,"0")+":"+String(mm).padStart(2,"0");
   }
+  function fmtHM(min){
+    const m=Math.max(0, Math.min(1439, min|0));
+    const hh=Math.floor(m/60), mm=m%60;
+    return String(hh).padStart(2,"0")+":"+String(mm).padStart(2,"0");
+  }
+  function setBrightnessUI(pct){
+    if (br) br.value = pct;
+  }
+  function clampSmoothAmt(v){
+    v = parseInt(v||"3",10);
+    if (!isFinite(v)) v = 3;
+    if (v < 1) v = 1;
+    if (v > 6) v = 6;
+    return v;
+  }
+  function setSmoothAmtUI(v){
+    const amt = clampSmoothAmt(v);
+    if (smoothAmt) smoothAmt.value = String(amt);
+    if (smoothAmtVal) smoothAmtVal.textContent = String(amt);
+    return amt;
+  }
+  function sendBrightness(pct){
+    if (!br) return;
+    const v = Math.max(0, Math.min(100, pct|0));
+    fetch(`/api/brightness?pct=${v}`, {method:"POST"}).catch(()=>{});
+  }
 
   function fetchJSON(url){
     return fetch(url,{cache:"no-store"}).then(r=>r.json());
   }
 
+  function setPowerUI(js){
+    if(!js) return;
+    if (autoOff && js.autoOffSec!=null) autoOff.value = String(js.autoOffSec|0);
+    if (js.screenOff!=null) screenIsOff = !!js.screenOff;
+    if (scrBtn && js.screenOff!=null) scrBtn.textContent = screenIsOff ? "Screen: Off" : "Screen: On";
+    if (schedOn && js.schedEnabled!=null) schedOn.checked = !!js.schedEnabled;
+    if (offAt && js.offMin!=null) offAt.value = fmtHM(js.offMin);
+    if (onAt && js.onMin!=null) onAt.value = fmtHM(js.onMin);
+  }
+  function fetchPower(){
+    if(!scrBtn && !autoOff) return;
+    fetchJSON("/api/power").then(setPowerUI).catch(()=>{});
+  }
+  function sendPower(params){
+    const q=new URLSearchParams(params||{}).toString();
+    fetch(`/api/power?${q}`, {method:"POST"}).then(()=>fetchPower()).catch(()=>{});
+  }
+
   function fetchStatus(){
     fetchJSON("/status").then(js=>{
       lastStatusT=Date.now();
+      statusSlot=(js && js.slot!=null)?(js.slot|0):null;
       const co2=(js.co2!=null)?Math.round(js.co2):"--";
       const t  =(js.temp!=null)?Number(js.temp).toFixed(1):"--";
       const h  =(js.hum!=null)?Math.round(js.hum):"--";
-      liveEl.textContent=`Live: ${co2} ppm · ${t} °C · ${h} %`;
+      liveEl.textContent=`Live: ${co2} ppm - ${t} C - ${h} %`;
+      if (liveHero) liveHero.textContent = `${co2} ppm - ${t} C - ${h} %`;
+      if (liveCo2) liveCo2.textContent = `${co2} ppm`;
+      if (liveTemp) liveTemp.textContent = `${t} C`;
+      if (liveHum) liveHum.textContent = `${h} %`;
+
+      const co2Num = isFinite(co2) ? Number(co2) : null;
+      const tNum = isFinite(t) ? Number(t) : null;
+      const hNum = isFinite(h) ? Number(h) : null;
+
+      if (co2Num!=null && prevCo2!=null) {
+        const d = co2Num - prevCo2;
+        setTrend(liveCo2Trend, (d>25)?1:(d<-25)?-1:0);
+      }
+      if (tNum!=null && prevTemp!=null) {
+        const d = tNum - prevTemp;
+        setTrend(liveTempTrend, (d>0.3)?1:(d<-0.3)?-1:0);
+      }
+      if (hNum!=null && prevHum!=null) {
+        const d = hNum - prevHum;
+        setTrend(liveHumTrend, (d>1)?1:(d<-1)?-1:0);
+      }
+      if (co2Num!=null) prevCo2 = co2Num;
+      if (tNum!=null) prevTemp = tNum;
+      if (hNum!=null) prevHum = hNum;
+
+      if (liveMeta) liveMeta.textContent = "Updated just now";
     }).catch(()=>{});
   }
   function tickLiveChip(){
     const stale=(Date.now()-lastStatusT)>60000;
     liveChip.classList.toggle("stale", stale);
+    if (liveMeta && lastStatusT) {
+      const sec = Math.floor((Date.now() - lastStatusT) / 1000);
+      let msg = "Updated just now";
+      if (sec >= 5 && sec < 60) msg = `Updated ${sec}s ago`;
+      else if (sec >= 60 && sec < 3600) msg = `Updated ${Math.floor(sec/60)}m ago`;
+      else if (sec >= 3600) msg = `Updated ${Math.floor(sec/3600)}h ago`;
+      liveMeta.textContent = msg;
+    }
+  }
+  function fetchBrightness(){
+    if(!br) return;
+    fetchJSON("/api/brightness").then(js=>{
+      if(js&&js.pct!=null) setBrightnessUI(js.pct);
+      if (js.battery!=null && battEl){
+        battEl.textContent=`${Number(js.battery).toFixed(2)} V`;
+        if (battChip){
+          const low = js.battery < 3.5;
+          battChip.classList.toggle("stale", low);
+        }
+      }
+    }).catch(()=>{});
   }
 
   function buildDaySelect(){
@@ -1970,10 +2714,25 @@ canvas{
     o0.value=TODAY; o0.textContent="Today (live)";
     sel.appendChild(o0);
 
+    function formatDayName(name, fallback){
+      // name: day_YYYYDDD.bin (DDD = day-of-year 001..366)
+      const m=/^day_(\d{4})(\d{3})\.bin$/.exec(name||"");
+      if(!m) return fallback||name;
+      const year=parseInt(m[1],10);
+      const doy=parseInt(m[2],10);
+      if(!year || !doy) return fallback||name;
+      if(year < 1970) return `Day ${String(doy).padStart(3,"0")}`; // offline/pseudo days
+      const dt=new Date(Date.UTC(year,0,1));
+      dt.setUTCDate(doy);
+      const mm=String(dt.getUTCMonth()+1).padStart(2,"0");
+      const dd=String(dt.getUTCDate()).padStart(2,"0");
+      return `${year}-${mm}-${dd}`;
+    }
+
     dayList.forEach(d=>{
       const o=document.createElement("option");
       if(typeof d==="string"){ o.value=d; o.textContent=d; }
-      else { o.value=d.name; o.textContent=d.label||d.name; }
+      else { o.value=d.name; o.textContent=formatDayName(d.name, d.label)||d.name; }
       sel.appendChild(o);
     });
 
@@ -2003,6 +2762,8 @@ canvas{
   function restorePrefs(){
     setTheme(LS.g("theme","dark"));
     smoothEl.checked=LS.g("smooth",true);
+    setSmoothAmtUI(LS.g("smoothAmt",3));
+    if (smoothAmt) smoothAmt.disabled = !smoothEl.checked;
     modeEl.value=LS.g("mode","line");
     cOn.checked=LS.g("cOn",true);
     tOn.checked=LS.g("tOn",true);
@@ -2010,20 +2771,88 @@ canvas{
   }
   function savePrefs(){
     LS.s("smooth",!!smoothEl.checked);
+    LS.s("smoothAmt",clampSmoothAmt(smoothAmt ? smoothAmt.value : 3));
     LS.s("mode",modeEl.value||"line");
     LS.s("cOn",!!cOn.checked);
     LS.s("tOn",!!tOn.checked);
     LS.s("hOn",!!hOn.checked);
   }
-  [smoothEl,modeEl,cOn,tOn,hOn].forEach(el=>el.addEventListener("change",()=>{savePrefs(); draw(); renderStats();}));
+  [smoothEl,modeEl,cOn,tOn,hOn].forEach(el=>el.addEventListener("change",()=>{
+    savePrefs();
+    smoothCacheKey="";
+    viewCacheKey="";
+    scheduleDraw();
+    renderStats();
+  }));
+  if (smoothEl){
+    smoothEl.addEventListener("change",()=>{
+      if (smoothAmt) smoothAmt.disabled = !smoothEl.checked;
+    });
+  }
+  if (smoothAmt){
+    smoothAmt.addEventListener("input",()=>{
+      setSmoothAmtUI(smoothAmt.value);
+      savePrefs();
+      smoothCacheKey="";
+      viewCacheKey="";
+      scheduleDraw();
+      renderStats();
+    });
+  }
+  if (br){
+    br.addEventListener("input",()=>{
+      const v=parseInt(br.value||"0",10);
+      clearTimeout(brTimer);
+      brTimer=setTimeout(()=>sendBrightness(v),120);
+    });
+    br.addEventListener("change",()=>{
+      const v=parseInt(br.value||"0",10);
+      sendBrightness(v);
+    });
+  }
+  if (scrBtn){
+    scrBtn.addEventListener("click",()=>{
+      sendPower({off: screenIsOff ? 0 : 1});
+    });
+  }
+  if (autoOff){
+    autoOff.addEventListener("change",()=>{
+      const sec=parseInt(autoOff.value||"0",10);
+      sendPower({auto: isFinite(sec)?sec:0});
+    });
+  }
+  if (schedOn){
+    schedOn.addEventListener("change",()=>{
+      const enabled = !!schedOn.checked;
+      const params = {sched: enabled ? 1 : 0};
+      if (offAt && offAt.value) params.offAt = offAt.value;
+      if (onAt && onAt.value) params.onAt = onAt.value;
+      sendPower(params);
+    });
+  }
+  if (offAt){
+    offAt.addEventListener("change",()=>{
+      if (offAt.value) sendPower({offAt: offAt.value});
+    });
+  }
+  if (onAt){
+    onAt.addEventListener("change",()=>{
+      if (onAt.value) sendPower({onAt: onAt.value});
+    });
+  }
 
   // ----- data load -----
   function load(name, resetView){
     LS.s("daySel",name);
     const url = (name===TODAY) ? "/api/today" : ("/api/daydata?name="+encodeURIComponent(name));
     fetchJSON(url).then(d=>{
-      if(!d || !Array.isArray(d.co2) || d.co2.length<2){ data=null; draw(); renderStats(); return; }
-      data=d;
+      if(!d || !Array.isArray(d.co2) || d.co2.length<2){ data=null; scheduleDraw(); renderStats(); return; }
+      data=d; dataVer++;
+      smoothCacheKey=""; viewCacheKey="";
+      if(name===TODAY){
+        lastTodayFetchT=Date.now();
+        if(d.slot!=null) lastTodaySlot=d.slot|0;
+      }
       const N=data.co2.length;
       if(resetView){ viewMin=0; viewMax=N-1; }
       else{
@@ -2034,8 +2863,8 @@ canvas{
       hover=null; locked=false;
       $("stTitle").textContent=(name===TODAY)?"Today stats":"Day stats";
       renderStats();
-      draw();
-    }).catch(()=>{ data=null; draw(); renderStats(); });
+      scheduleDraw();
+    }).catch(()=>{ data=null; scheduleDraw(); renderStats(); });
   }
   sel.addEventListener("change",()=>load(sel.value,true));
 
@@ -2045,11 +2874,11 @@ canvas{
       if(!data||!Array.isArray(data.co2))return;
       const N=data.co2.length, step=data.stepMin||5;
       const r=b.dataset.r;
-      if(r==="all"){ viewMin=0; viewMax=N-1; draw(); return; }
+      if(r==="all"){ viewMin=0; viewMax=N-1; scheduleDraw(); return; }
       const mins=(r==="6h")?360:(r==="12h")?720:1440;
       const pts=Math.max(12,Math.round(mins/step));
       viewMax=N-1; viewMin=Math.max(0,viewMax-(pts-1));
-      draw();
+      scheduleDraw();
     });
   });
 
@@ -2062,23 +2891,29 @@ canvas{
     const W=Math.round(cssW*DPR), H=Math.round(cssH*DPR);
     if(cv.width!==W||cv.height!==H){ cv.width=W; cv.height=H; }
     ctx.setTransform(DPR,0,0,DPR,0,0);
-    draw();
+    scheduleDraw();
   }
   let rt=0; window.addEventListener("resize",()=>{clearTimeout(rt);rt=setTimeout(resize,120)});
 
-  // ----- smoothing (3-tap, gap-aware) -----
+  // ----- smoothing (5-tap, gap-aware, two-pass) -----
   function smooth(arr, isGap){
     if(!smoothEl.checked) return arr;
-    const out=arr.slice();
-    for(let i=0;i<arr.length;i++){
-      const v=arr[i]; if(isGap(v)) continue;
-      let s=0,c=0;
-      for(let k=-1;k<=1;k++){
-        const j=i+k; if(j<0||j>=arr.length) continue;
-        const vv=arr[j]; if(isGap(vv)) continue;
-        s+=vv; c++;
+    const weights=[1,2,3,2,1];
+    const passes=clampSmoothAmt(smoothAmt ? smoothAmt.value : 3);
+    let out=arr.slice();
+    for(let pass=0; pass<passes; pass++){
+      const src=out.slice();
+      for(let i=0;i<src.length;i++){
+        const v=src[i]; if(isGap(v)) continue;
+        let s=0,w=0;
+        for(let k=-2;k<=2;k++){
+          const j=i+k; if(j<0||j>=src.length) continue;
+          const vv=src[j]; if(isGap(vv)) continue;
+          const wt=weights[k+2];
+          s+=vv*wt; w+=wt;
+        }
+        if(w) out[i]=s/w;
       }
-      if(c) out[i]=s/c;
     }
     return out;
   }
@@ -2094,16 +2929,16 @@ canvas{
   }
   function renderStats(){
     const sC=$("sC"),sT=$("sT"),sH=$("sH"),rC=$("rC"),rT=$("rT"),rH=$("rH"),info=$("stInfo");
-    if(!data){ sC.textContent=sT.textContent=sH.textContent="Avg —"; rC.textContent=rT.textContent=rH.textContent="Min — · Max —"; info.textContent="Samples —"; return; }
+    if(!data){ sC.textContent=sT.textContent=sH.textContent="Avg --"; rC.textContent=rT.textContent=rH.textContent="Min -- - Max --"; info.textContent="Samples --"; return; }
     const co2=data.co2||[], t=data.temp||[], h=data.hum||[];
     const C=scan(co2,v=>!v), T=scan(t,v=>v==null), H=scan(h,v=>v==null);
-    sC.textContent=(C.avg!=null)?`Avg ${Math.round(C.avg)} ppm`:"Avg —";
-    sT.textContent=(T.avg!=null)?`Avg ${Number(T.avg).toFixed(1)} °C`:"Avg —";
-    sH.textContent=(H.avg!=null)?`Avg ${Math.round(H.avg)} %`:"Avg —";
-    rC.textContent=(C.mn!=null)?`Min ${Math.round(C.mn)} · Max ${Math.round(C.mx)}`:"Min — · Max —";
-    rT.textContent=(T.mn!=null)?`Min ${Number(T.mn).toFixed(1)} · Max ${Number(T.mx).toFixed(1)}`:"Min — · Max —";
-    rH.textContent=(H.mn!=null)?`Min ${Math.round(H.mn)} % · Max ${Math.round(H.mx)} %`:"Min — · Max —";
-    const n=(data.slots||co2.length||288);
+    sC.textContent=(C.avg!=null)?`Avg ${Math.round(C.avg)} ppm`:"Avg --";
+    sT.textContent=(T.avg!=null)?`Avg ${Number(T.avg).toFixed(1)}  C`:"Avg --";
+    sH.textContent=(H.avg!=null)?`Avg ${Math.round(H.avg)} %`:"Avg --";
+    rC.textContent=(C.mn!=null)?`Min ${Math.round(C.mn)} - Max ${Math.round(C.mx)}`:"Min -- - Max --";
+    rT.textContent=(T.mn!=null)?`Min ${Number(T.mn).toFixed(1)} - Max ${Number(T.mx).toFixed(1)}`:"Min -- - Max --";
+    rH.textContent=(H.mn!=null)?`Min ${Math.round(H.mn)} % - Max ${Math.round(H.mx)} %`:"Min -- - Max --";
+    const n=(data.slots||co2.length||720);
     info.textContent=`Samples ${Math.max(C.c,T.c,H.c)}/${n}`;
   }
 
@@ -2249,12 +3084,7 @@ canvas{
     const W=cssW,H=cssH;
     ctx.clearRect(0,0,W,H);
 
-    const cs=getComputedStyle(document.documentElement);
-    const panel=cs.getPropertyValue("--panel").trim()||"#10172c";
-    const grid =cs.getPropertyValue("--grid").trim()||"rgba(255,255,255,.10)";
-    const stroke=cs.getPropertyValue("--stroke").trim()||"rgba(255,255,255,.12)";
-    const muted=cs.getPropertyValue("--muted").trim()||"rgba(234,240,255,.72)";
-    const accent=cs.getPropertyValue("--accent").trim()||"#fad24f";
+    const {panel,grid,stroke,muted,accent}=getThemeColors();
 
     ctx.fillStyle=panel; ctx.fillRect(0,0,W,H);
 
@@ -2276,32 +3106,77 @@ canvas{
     const gxW=(gx1-gx0);
     const xOf=(i)=>gx0 + ((i-i0)/Math.max(1,(len-1))) * gxW;
 
-    let cmin=1e9,cmax=-1e9,tmin=1e9,tmax=-1e9,hmin=1e9,hmax=-1e9;
-    for(let i=i0;i<=i1;i++){
-      const c=data.co2[i]||0, t=data.temp[i], h=data.hum[i];
-      if(c>0){ cmin=Math.min(cmin,c); cmax=Math.max(cmax,c); }
-      if(t!=null){ tmin=Math.min(tmin,t); tmax=Math.max(tmax,t); }
-      if(h!=null){ hmin=Math.min(hmin,h); hmax=Math.max(hmax,h); }
-    }
-    if(!(cmax>cmin)){ cmin=300; cmax=2000; }
-    if(!(tmax>tmin)){ tmin=10; tmax=40; }
-    if(!(hmax>hmin)){ hmin=20; hmax=80; }
+    const vcKey=`${dataVer}|${i0}|${i1}`;
+    let cmin,cmax,tmin,tmax,hmin,hmax;
+    if(viewCache && viewCacheKey===vcKey){
+      ({cmin,cmax,tmin,tmax,hmin,hmax}=viewCache);
+    }else{
+      cmin=1e9; cmax=-1e9; tmin=1e9; tmax=-1e9; hmin=1e9; hmax=-1e9;
+      for(let i=i0;i<=i1;i++){
+        const c=data.co2[i]||0, t=data.temp[i], h=data.hum[i];
+        if(c>0){ cmin=Math.min(cmin,c); cmax=Math.max(cmax,c); }
+        if(t!=null){ tmin=Math.min(tmin,t); tmax=Math.max(tmax,t); }
+        if(h!=null){ hmin=Math.min(hmin,h); hmax=Math.max(hmax,h); }
+      }
+      if(!(cmax>cmin)){ cmin=300; cmax=2000; }
+      if(!(tmax>tmin)){ tmin=10; tmax=40; }
+      if(!(hmax>hmin)){ hmin=20; hmax=80; }
 
-    [cmin,cmax]=pad(cmin,cmax,0.08);
-    [tmin,tmax]=pad(tmin,tmax,0.10);
-    [hmin,hmax]=pad(hmin,hmax,0.10);
+      [cmin,cmax]=pad(cmin,cmax,0.08);
+      [tmin,tmax]=pad(tmin,tmax,0.10);
+      [hmin,hmax]=pad(hmin,hmax,0.10);
+      viewCache={cmin,cmax,tmin,tmax,hmin,hmax};
+      viewCacheKey=vcKey;
+    }
+
+    const showC=!!cOn.checked, showT=!!tOn.checked, showH=!!hOn.checked;
+    const hasC=showC && (cmax>cmin);
+    const hasT=showT && (tmax>tmin);
+    const hasH=showH && (hmax>hmin);
+
+    let aMin,aMax,aUnit,aLabel;
+    if(hasC){ aMin=cmin; aMax=cmax; aUnit="ppm"; aLabel="CO2"; }
+    else if(hasT){ aMin=tmin; aMax=tmax; aUnit="C"; aLabel="Temp"; }
+    else { aMin=hmin; aMax=hmax; aUnit="%"; aLabel="Humidity"; }
+
+    [aMin,aMax]=pad(aMin,aMax,0.10);
+    const minSpan=(aUnit==="ppm")?200:(aUnit==="%")?15:8;
+    if((aMax-aMin)<minSpan){
+      const mid=(aMin+aMax)/2;
+      aMin=mid-minSpan/2; aMax=mid+minSpan/2;
+    }
+    if(aUnit==="ppm"){
+      aMin=Math.max(300,aMin); aMax=Math.min(4000, Math.max(aMax,aMin+minSpan));
+    }else if(aUnit==="%"){
+      aMin=Math.max(0,aMin); aMax=Math.min(100, Math.max(aMax,aMin+minSpan));
+    }else{
+      aMin=Math.max(-20,aMin); aMax=Math.min(60, Math.max(aMax,aMin+minSpan));
+    }
 
     const yC=(v)=>yMap(v,cmin,cmax,gy0,gy1);
     const yT=(v)=>yMap(v,tmin,tmax,gy0,gy1);
     const yH=(v)=>yMap(v,hmin,hmax,gy0,gy1);
+    const yA=(v)=>yMap(v,aMin,aMax,gy0,gy1);
 
-    const co2=smooth(data.co2, v=>!v);
-    const tt =smooth(data.temp, v=>v==null);
-    const hh =smooth(data.hum,  v=>v==null);
+    const smoothLevel = smoothEl.checked ? clampSmoothAmt(smoothAmt ? smoothAmt.value : 3) : 0;
+    const smKey=`${dataVer}|${smoothLevel}`;
+    if(smKey!==smoothCacheKey){
+      smoothCacheKey=smKey;
+      if(smoothEl.checked){
+        co2Sm=smooth(data.co2, v=>!v);
+        ttSm =smooth(data.temp, v=>v==null);
+        hhSm =smooth(data.hum,  v=>v==null);
+      }else{
+        co2Sm=null; ttSm=null; hhSm=null;
+      }
+    }
+    const co2=co2Sm||data.co2;
+    const tt =ttSm ||data.temp;
+    const hh =hhSm ||data.hum;
 
     // captions
     ctx.fillStyle=muted; ctx.font="11px ui-monospace,Menlo,Consolas,monospace";
-    ctx.textAlign="left";  ctx.fillText("CO₂ ppm", 6, gy0-2);
+    ctx.textAlign="left";  ctx.fillText(String(aLabel)+" "+aUnit, 6, gy0-2);
 
     // clip plot to rounded rect
     ctx.save();
@@ -2340,7 +3215,6 @@ canvas{
 
     // series
     const mode=modeEl.value||"line";
-    const showC=!!cOn.checked, showT=!!tOn.checked, showH=!!hOn.checked;
 
     if(showT){ areaFill(tt, TT, xOf, yT, v=>v==null, i0,i1, gy1); line(tt, TT, xOf, yT, v=>v==null, i0,i1); }
     if(showH){ areaFill(hh, HH, xOf, yH, v=>v==null, i0,i1, gy1); line(hh, HH, xOf, yH, v=>v==null, i0,i1); }
@@ -2375,14 +3249,15 @@ canvas{
     roundRectPath(gx0, gy0, (gx1-gx0), (gy1-gy0), 12);
     ctx.stroke();
 
-    // CO2 y labels (left)
+    // Y-axis labels (anchor series)
     ctx.fillStyle=muted;
     ctx.font="11px ui-monospace,Menlo,Consolas,monospace";
     ctx.textAlign="right";
     for(let k=0;k<5;k++){
       const y=gy0 + (gy1-gy0)*(k/4);
-      const v = cmax - (cmax-cmin)*(k/4);
-      ctx.fillText(String(Math.round(v)), gx0-8, y+4);
+      const v = aMax - (aMax-aMin)*(k/4);
+      const lab = (aUnit==="ppm") ? Math.round(v) : (aUnit==="%" ? Math.round(v) : v.toFixed(1));
+      ctx.fillText(String(lab), gx0-8, y+4);
     }
 
     // x labels (below)
@@ -2404,10 +3279,10 @@ canvas{
     const step=data.stepMin||5;
     const parts=[fmtTime(hover,step)];
     const c=data.co2[hover]||0, t=data.temp[hover], h=data.hum[hover];
-    if(cOn.checked && c) parts.push(`CO₂ ${Math.round(c)} ppm`);
-    if(tOn.checked && t!=null) parts.push(`T ${Number(t).toFixed(1)} °C`);
+    if(cOn.checked && c) parts.push(`CO2� ${Math.round(c)} ppm`);
+    if(tOn.checked && t!=null) parts.push(`T ${Number(t).toFixed(1)}  C`);
     if(hOn.checked && h!=null) parts.push(`H ${Math.round(h)} %`);
-    showTip(parts.join(" · "));
+    showTip(parts.join(" - "));
   }
 
   // mouse/pen hover
@@ -2422,7 +3297,7 @@ canvas{
     const padL=62,padR=24;
     const gx0=padL,gx1=cssW-padR;
 
-    if(x<gx0||x>gx1){ hover=null; hideTip(); draw(); return; }
+    if(x<gx0||x>gx1){ hover=null; hideTip(); scheduleDraw(); return; }
 
     const N=data.co2.length;
     const i0=Math.max(0,Math.min(viewMin,viewMax));
@@ -2435,10 +3310,10 @@ canvas{
     hover=idx;
 
     updateTip();
-    draw();
+    scheduleDraw();
   });
 
-  cv.addEventListener("pointerleave",()=>{ if(!locked){ hover=null; hideTip(); draw(); }});
+  cv.addEventListener("pointerleave",()=>{ if(!locked){ hover=null; hideTip(); scheduleDraw(); }});
   cv.addEventListener("click",()=>{ locked=!locked; if(!locked&&hover==null) hideTip(); else updateTip(); });
 
   // wheel zoom (desktop)
@@ -2470,7 +3345,7 @@ canvas{
     if(nx>N-1){ nx=N-1; nm=N-newLen; }
 
     viewMin=nm; viewMax=nx;
-    draw();
+    scheduleDraw();
   },{passive:false});
 
   // ----- touch gestures (phones): drag=pan, pinch=zoom, double-tap=reset -----
@@ -2505,11 +3380,11 @@ canvas{
     if(nm<0){ nm=0; nx=newLen-1; }
     if(nx>g.N-1){ nx=g.N-1; nm=g.N-newLen; }
     viewMin=nm; viewMax=nx;
-    draw();
+    scheduleDraw();
   }
   function setMobileHint(){
     const h=$("hint"); if(!h) return;
-    h.textContent="Drag: pan · Pinch: zoom · Tap: tooltip · Double-tap: reset";
+    h.textContent="Drag: pan - Pinch: zoom - Tap: tooltip - Double-tap: reset";
   }
   cv.addEventListener("pointerdown",(ev)=>{
     if(ev.pointerType!=="touch") return;
@@ -2531,7 +3406,7 @@ canvas{
       const g=geom();
       viewMin=0; viewMax=g.N-1;
       locked=false; hover=null; hideTip();
-      draw();
+      scheduleDraw();
       return;
     }
 
@@ -2586,7 +3461,7 @@ canvas{
     viewMax=clamp(nx,0,g.N-1);
 
     locked=false; hover=null; hideTip();
-    draw();
+    scheduleDraw();
   });
 
   cv.addEventListener("pointerup",(ev)=>{
@@ -2602,7 +3477,7 @@ canvas{
         locked=true;
         lastPX=ev.clientX; lastPY=ev.clientY;
         updateTip();
-        draw();
+        scheduleDraw();
       }
     }
 
@@ -2627,13 +3502,21 @@ canvas{
   };
 
   // today auto refresh
-  function todayTick(){ if(sel.value===TODAY) load(TODAY,false); }
+  function todayTick(){
+    if(sel.value!==TODAY) return;
+    const now=Date.now();
+    const slotChanged=(statusSlot!=null && lastTodaySlot!=null && statusSlot!==lastTodaySlot);
+    const stale=(now-lastTodayFetchT)>60000;
+    if(slotChanged || stale) load(TODAY,false);
+  }
 
   // init
   restorePrefs();
   fetchStatus(); setInterval(fetchStatus,30000);
+  fetchBrightness(); setInterval(fetchBrightness,60000);
+  fetchPower(); setInterval(fetchPower,60000);
   setInterval(tickLiveChip,1500);
-  setInterval(todayTick,12000);
+  setInterval(todayTick,15000);
 
   requestAnimationFrame(()=>{ resize(); fetchDayList(); });
 
@@ -2644,10 +3527,15 @@ canvas{
 
 // ---------- Web handler ----------
 static void handleWebRoot() {
+  noteUserActivity(!screenOffForced);
+  // Avoid cached HTML/CSS/JS after UI updates
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
   server.send_P(200, "text/html; charset=utf-8", WEB_ROOT_HTML);
 }
 
 static void handleStatus() {
+  noteUserActivity(!screenOffForced);
   // No caching
   server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
   server.sendHeader("Pragma", "no-cache");
@@ -2662,13 +3550,45 @@ static void handleStatus() {
   out += (offlineMode ? "true" : "false");
   out += ",\"deviceEpoch\":";
   out += String((unsigned long)approxNow());
+  out += ",\"slot\":";
+  out += String((int)currentSlot);
+  out += ",\"stepMin\":";
+  out += String((int)SLOT_MINUTES);
 
   out += ",\"co2\":";
   out += (isnan(currentCO2)  ? "null" : String(currentCO2, 1));
+  out += ",\"co2Offset\":";
+  out += String((int)co2OffsetPpm);
   out += ",\"temp\":";
   out += (isnan(currentTemp) ? "null" : String(currentTemp, 1));
   out += ",\"hum\":";
   out += (isnan(currentHum)  ? "null" : String(currentHum, 0));
+  out += ",\"battery\":";
+  out += (isnan(batteryV) ? "null" : String(batteryV, 2));
+  out += ",\"brightness\":";
+  out += String((int)getBrightnessPct());
+  out += ",\"screenOff\":";
+  out += (screenOff ? "true" : "false");
+  out += ",\"autoOffSec\":";
+  out += String((unsigned long)(screenAutoOffMs / 1000UL));
+  out += ",\"fsReady\":";
+  out += (fsReady ? "true" : "false");
+  out += ",\"lastSaveMs\":";
+  out += String((unsigned long)lastSaveMs);
+  out += ",\"lastSaveOk\":";
+  out += (lastSaveOk ? "true" : "false");
+  out += ",\"lastSaveName\":\"";
+  out += lastSaveName;
+  out += "\"";
+  out += ",\"lastLoadMs\":";
+  out += String((unsigned long)lastLoadMs);
+  out += ",\"lastLoadOk\":";
+  out += (lastLoadOk ? "true" : "false");
+  out += ",\"lastLoadName\":\"";
+  out += lastLoadName;
+  out += "\"";
+  out += ",\"initialDataLoaded\":";
+  out += (initialDataLoaded ? "true" : "false");
 
   out += "}";
 
@@ -2676,7 +3596,178 @@ static void handleStatus() {
 }
 
 
+#if ENABLE_BL_HTTP
+static void handleBrightness() {
+  noteUserActivity(!screenOffForced);
+  int pct = getBrightnessPct();
+  if (server.hasArg("pct")) {
+    int v = server.arg("pct").toInt();
+    pct = constrain(v, 0, 100);
+    applyBrightnessPct(pct);
+  }
+  String out = "{\"pct\":";
+  out += String(pct);
+  out += ",\"battery\":";
+  out += (isnan(batteryV) ? "null" : String(batteryV, 2));
+  out += "}";
+  server.send(200, "application/json", out);
+}
+
+
+#endif
+
+static void handlePowerSave() {
+  bool changed = false;
+
+  if (server.hasArg("auto")) {
+    int sec = server.arg("auto").toInt();
+    if (sec < 0) sec = 0;
+    if (sec > (int)(24UL * 60UL * 60UL)) sec = (int)(24UL * 60UL * 60UL);
+    screenAutoOffMs = (uint32_t)sec * 1000UL;
+    changed = true;
+  }
+  if (server.hasArg("sched")) {
+    screenScheduleEnabled = (server.arg("sched").toInt() != 0);
+    changed = true;
+  }
+  if (server.hasArg("offAt")) {
+    uint16_t m = 0;
+    if (parseTimeHHMM(server.arg("offAt"), &m)) {
+      screenScheduleOffMin = m;
+      changed = true;
+    }
+  }
+  if (server.hasArg("onAt")) {
+    uint16_t m = 0;
+    if (parseTimeHHMM(server.arg("onAt"), &m)) {
+      screenScheduleOnMin = m;
+      changed = true;
+    }
+  }
+
+  if (server.hasArg("off")) {
+    const bool wantOff = server.arg("off").toInt() != 0;
+    if (wantOff) {
+      lastUserActivityMs = millis();
+      screenOff = true;
+      screenOffForced = true;
+      screenOffByAuto = false;
+      screenScheduleOverride = false;
+      applyBacklightOutput();
+    } else {
+      screenOffByAuto = false;
+      screenOffForced = false;
+      if (screenScheduleEnabled && isScheduleActive()) {
+        screenScheduleOverride = true;
+        screenOffBySchedule = false;
+      } else {
+        screenScheduleOverride = false;
+      }
+      screenOff = false;
+      applyBacklightOutput();
+      screenWakeReq = true;
+      lastUserActivityMs = millis();
+    }
+    changed = true;
+  } else {
+    noteUserActivity(!screenOffForced);
+  }
+
+#if ENABLE_FS
+  if (changed) savePowerCfgToFS();
+#endif
+
+  applyScheduleState();
+
+  String out;
+  out.reserve(140);
+  out += "{";
+  out += "\"screenOff\":";
+  out += (screenOff ? "true" : "false");
+  out += ",\"forced\":";
+  out += (screenOffForced ? "true" : "false");
+  out += ",\"autoOffSec\":";
+  out += String((unsigned long)(screenAutoOffMs / 1000UL));
+  out += ",\"schedEnabled\":";
+  out += (screenScheduleEnabled ? "true" : "false");
+  out += ",\"offMin\":";
+  out += String((int)screenScheduleOffMin);
+  out += ",\"onMin\":";
+  out += String((int)screenScheduleOnMin);
+  out += ",\"schedActive\":";
+  out += (screenOffBySchedule ? "true" : "false");
+  out += "}";
+  server.send(200, "application/json", out);
+}
+
+
+#if ENABLE_CO2_OFFSET_HTTP
+static void handleCo2Offset() {
+  noteUserActivity(!screenOffForced);
+  int v = (int)co2OffsetPpm;
+  if (server.hasArg("ppm")) {
+    v = server.arg("ppm").toInt();
+    v = constrain(v, -500, 500);
+    co2OffsetPpm = (int16_t)v;
+#if ENABLE_FS
+    saveCo2OffsetToFS();
+#endif
+  }
+  String out = "{\"ppm\":";
+  out += String((int)co2OffsetPpm);
+  out += "}";
+  server.send(200, "application/json", out);
+}
+
+#endif
+
+#if ENABLE_AC_HTTP
+static void acSendEnv() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (isnan(currentTemp) && isnan(currentHum) && isnan(currentCO2)) return;
+
+  uint32_t nowMs = millis();
+  if ((uint32_t)(nowMs - acLastSendMs) < AC_HTTP_MIN_SEND_MS) return;
+
+  String url = String("http://") + AC_HTTP_HOST + "/api/env?";
+  bool first = true;
+  if (!isnan(currentTemp)) {
+    url += "temp=" + String(currentTemp, 1);
+    first = false;
+  }
+  if (!isnan(currentHum)) {
+    if (!first) url += "&";
+    url += "hum=" + String(currentHum, 0);
+    first = false;
+  }
+  if (!isnan(currentCO2)) {
+    if (!first) url += "&";
+    url += "co2=" + String(currentCO2, 0);
+  }
+
+  WiFiClient client;
+  HTTPClient http;
+  if (!http.begin(client, url)) return;
+  int code = http.GET();
+  http.end();
+
+  if (code > 0 && code < 400) {
+    acLastSendMs = nowMs;
+  }
+}
+
+static void tickAcControl() {
+  const uint32_t nowMs = millis();
+  if ((uint32_t)(nowMs - acLastTickMs) < AC_HTTP_TICK_MS) return;
+  acLastTickMs = nowMs;
+
+  acSendEnv();
+}
+#endif
+
+
 static void handleToday() {
+  noteUserActivity(!screenOffForced);
   writeLiveSlotPreviewToBuffers();
 
   // No caching
@@ -2689,14 +3780,14 @@ static void handleToday() {
   auto sendS = [&](const String& s) { server.sendContent(s); yield(); };
   auto sendC = [&](const char* s)   { server.sendContent(s); yield(); };
 
-  const int SLOT_MINUTES = 5;
+  const int slotMinutes = SLOT_MINUTES;
   const unsigned long nowEpoch = (unsigned long)approxNow();
   const int slot = currentSlot;
-  const int minuteOfDay = (slot < 0) ? 0 : slot * SLOT_MINUTES;
+  const int minuteOfDay = (slot < 0) ? 0 : slot * slotMinutes;
 
   sendC("{");
   sendC("\"name\":\"__TODAY__\""); // (nice for UI / stats handler)
-  sendC(",\"stepMin\":");       sendS(String(SLOT_MINUTES));
+  sendC(",\"stepMin\":");       sendS(String(slotMinutes));
   sendC(",\"slots\":");         sendS(String(SLOTS_PER_DAY));
   sendC(",\"epoch\":");         sendS(String(nowEpoch));
   sendC(",\"slot\":");          sendS(String(slot));
@@ -2737,7 +3828,9 @@ static void handleToday() {
 }
 
 
+
 static void handleDayList() {
+  noteUserActivity(!screenOffForced);
 #if !ENABLE_FS
   server.send(200, "application/json", "[]");
 #else
@@ -2747,16 +3840,41 @@ static void handleDayList() {
   char names[MAX_FILES][24];
   int count = 0;
 
-  Dir dir = LittleFS.openDir("/");
-  while (dir.next()) {
-    String fn = dir.fileName();
-    if (!fn.startsWith("/day_") || !fn.endsWith(".bin")) continue;
-    if (count < MAX_FILES) {
-      strncpy(names[count], fn.c_str()+1, sizeof(names[count]) - 1); // skip '/'
-      names[count][sizeof(names[count]) - 1] = '\0';
-      count++;
+  auto scan = [&](bool firstPass){
+    Dir dir = LittleFS.openDir("/");
+    count = 0;
+    while (dir.next()) {
+      String fn = dir.fileName();
+      const char* base = fn.c_str();
+      if (base[0] == '/') base++;
+      size_t len = strlen(base);
+      if (len < 8 || strncmp(base, "day_", 4) != 0 || strcmp(base + len - 4, ".bin") != 0) continue;
+      if (count < MAX_FILES) {
+        strncpy(names[count], base, sizeof(names[count]) - 1);
+        names[count][sizeof(names[count]) - 1] = '\0';
+        count++;
+      }
+    }
+    if (count == 0 && firstPass) {
+      // try forcing a save once if nothing is present
+      saveDataToFS(false);
+    }
+  };
+
+  scan(true);
+  if (count == 0) { scan(false); }
+
+  // Fallback: if still empty but we have a last saved file that exists, return it
+  if (count == 0 && lastSaveName[0]) {
+    String p = "/";
+    p += lastSaveName;
+    if (LittleFS.exists(p)) {
+      strncpy(names[0], lastSaveName, sizeof(names[0]) - 1);
+      names[0][sizeof(names[0]) - 1] = '\0';
+      count = 1;
     }
   }
+
   if (count == 0) { server.send(200, "application/json", "[]"); return; }
 
   for (int i = 0; i < count - 1; ++i) {
@@ -2783,15 +3901,23 @@ static void handleDayList() {
 }
 
 
+
 static void handleDayData() {
+  noteUserActivity(!screenOffForced);
 #if !ENABLE_FS
   server.send(200, "application/json", "{}");
   return;
 #else
   if (!fsReady) { server.send(200, "application/json", "{}"); return; }
-  if (!server.hasArg("name")) { server.send(400, "text/plain", "Missing name"); return; }
+  String name;
+  if (server.hasArg("name")) {
+    name = server.arg("name");
+  } else if (lastSaveName[0]) {
+    name = lastSaveName;
+  } else {
+    server.send(400, "text/plain", "Missing name"); return;
+  }
 
-  String name = server.arg("name");
   if (name.indexOf('/') >= 0 || name.indexOf('\\') >= 0 || name.indexOf("..") >= 0) {
     server.send(400, "text/plain", "Bad name"); return;
   }
@@ -2833,8 +3959,6 @@ static void handleDayData() {
   auto sendS = [&](const String& s) { server.sendContent(s); yield(); };
   auto sendC = [&](const char* s)   { server.sendContent(s); yield(); };
 
-  const int SLOT_MINUTES = 5;
-
   sendC("{\"name\":\""); sendS(name);
   sendC("\",\"stepMin\":"); sendS(String(SLOT_MINUTES));
   sendC(",\"slots\":"); sendS(String(SLOTS_PER_DAY));
@@ -2861,6 +3985,7 @@ static void handleDayData() {
 #endif
 }
 
+
 // ===================== setup / loop =====================
 void setup(){
   Serial.begin(115200);
@@ -2871,7 +3996,7 @@ void setup(){
   digitalWrite(BL_PIN, LOW);
   analogWriteFreq(BL_PWM_HZ);
   analogWriteRange(BL_RANGE);
-  analogWrite(BL_PIN, blValue);
+  applyBrightnessPct(getBrightnessPct());
 
   // TFT
   tft.begin();
@@ -2888,9 +4013,21 @@ void setup(){
 #if ENABLE_FS
   fsReady = LittleFS.begin();
   if (!fsReady) {
-    Serial.println("LittleFS mount failed (NOT formatting).");
-  } else {
+    Serial.println("LittleFS mount failed.");
+#if FS_AUTOFORMAT_ON_FAIL
+    Serial.println("Formatting LittleFS...");
+    if (LittleFS.format()) {
+      fsReady = LittleFS.begin();
+      Serial.println(fsReady ? "LittleFS formatted and mounted." : "LittleFS re-mount failed after format.");
+    } else {
+      Serial.println("LittleFS format failed.");
+    }
+#endif
+  }
+  if (fsReady) {
     loadTimeAnchor();
+    loadCo2OffsetFromFS();
+    loadPowerCfgFromFS();
     loadDataFromFS();
   }
 #endif
@@ -2900,33 +4037,51 @@ void setup(){
 
   // WiFi + Time
   connectWiFi();
+  initOTA();
   initTime();
   if (isTimeValid()) anchorTimeToNow();
 
-  // Web routes
-  if (!offlineMode) {
-    server.on("/", HTTP_GET, handleWebRoot);
-    server.on("/api/daylist", HTTP_GET, handleDayList);
-    server.on("/api/daydata", HTTP_GET, handleDayData);
-    server.on("/api/today",   HTTP_GET, handleToday);
-    server.on("/status",      HTTP_GET, handleStatus);
-    server.begin();
+  // Web routes (serve UI even if NTP/time failed -> offlineMode)
+  server.on("/", HTTP_GET, handleWebRoot);
+  server.on("/api/daylist", HTTP_GET, handleDayList);
+  server.on("/api/daydata", HTTP_GET, handleDayData);
+  server.on("/api/today",   HTTP_GET, handleToday);
+  server.on("/status",      HTTP_GET, handleStatus);
+  server.on("/api/power",   HTTP_ANY, handlePowerSave);
+#if ENABLE_BL_HTTP
+  server.on("/api/brightness", HTTP_ANY, handleBrightness);
+#endif
+#if ENABLE_CO2_OFFSET_HTTP
+  server.on("/api/co2offset", HTTP_ANY, handleCo2Offset);
+#endif
+  server.begin();
+
+#if BUTTON_USE_A0
+  buttonA0Ready = true;
+  Serial.println("BUTTON A0 enabled (analog)");
+#else
+  int buttonIrq = NOT_AN_INTERRUPT;
+  if (BUTTON_PIN >= 0) {
+    buttonIrq = digitalPinToInterrupt(BUTTON_PIN);
+    if (buttonIrq != NOT_AN_INTERRUPT) {
+      button.begin(BUTTON_PIN, onBtnShort, nullptr, nullptr, nullptr, 0, 0);
+      pinMode(BUTTON_PIN, INPUT_PULLUP);
+      buttonReady = true;
+    }
   }
 
-  button.begin(BUTTON_PIN, onBtnShort, onBtnLongRequest, onBtnConfirm, onBtnConfirmTimeout, 5000, 5000);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  Serial.printf("PIN=%d irq=%d\n", (int)BUTTON_PIN, (int)digitalPinToInterrupt(BUTTON_PIN));;
+  if (buttonReady) {
+    Serial.printf("BUTTON pin=%d idle=%d irq=%d\n",
+                  BUTTON_PIN, digitalRead(BUTTON_PIN), buttonIrq);
+  } else {
+    Serial.printf("BUTTON disabled (BUTTON_PIN=%d irq=%d)\n",
+                  (int)BUTTON_PIN, buttonIrq);
+  }
+#endif
 
-Serial.printf("BUTTON pin=%d idle=%d irq=%d\n",
-              BUTTON_PIN, digitalRead(BUTTON_PIN),
-              digitalPinToInterrupt(BUTTON_PIN));
-Serial.print("BUTTON pin = "); Serial.println(BUTTON_PIN);
-Serial.print("BUTTON idle read = ");
-Serial.println(digitalRead(BUTTON_PIN));  // should be LOW when not pressed
 
-Serial.print("BUTTON irq = ");
-Serial.println(digitalPinToInterrupt(BUTTON_PIN)); // should NOT be NOT_AN_INTERRUPT
-
+  lastUserActivityMs = millis();
+  applyScheduleState();
 
   // Initial render
   drawAllScreens();
@@ -2939,24 +4094,67 @@ void loop() {
   if (nowMs - _blLastReapply > 60000UL) {
     analogWriteFreq(BL_PWM_HZ);
     analogWriteRange(BL_RANGE);
-    analogWrite(BL_PIN, blValue);
-    _blLastReapply = nowMs;
+    applyBacklightOutput();
   }
 
   // ---------- Network tasks ----------
-  if (!offlineMode) server.handleClient();
-  if (!offlineMode && WiFi.status() == WL_CONNECTED) MDNS.update();
+  if (WiFi.getMode() != WIFI_OFF) {
+    server.handleClient();
+    if (WiFi.status() == WL_CONNECTED) {
+      MDNS.update();
+#if ENABLE_OTA
+      ArduinoOTA.handle();
+#endif
+    }
+  }
+
+  // ---------- Time sync ----------
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!isTimeValid()) {
+      if ((uint32_t)(nowMs - lastTimeSyncMs) >= TIME_SYNC_RETRY_MS) {
+        requestTimeSync(false);
+        lastTimeSyncMs = nowMs;
+        if (time(nullptr) > 1600000000) {
+          offlineMode = false;
+          anchorTimeToNow();
+        }
+      }
+    } else if ((uint32_t)(nowMs - lastTimeSyncMs) >= TIME_SYNC_INTERVAL_MS) {
+      requestTimeSync(false);
+      lastTimeSyncMs = nowMs;
+      anchorTimeToNow();
+    }
+  }
+
+  // ---------- Scheduled screen off/on ----------
+  applyScheduleState();
+
+  // ---------- Auto screen-off ----------
+  if (screenAutoOffMs && !screenOffForced && !screenOffBySchedule && !screenOffByAuto &&
+      !screenOff && (nowMs - lastUserActivityMs >= screenAutoOffMs)) {
+    screenOffByAuto = true;
+    screenOff = true;
+    applyBacklightOutput();
+  }
 
   // ---------- Button state machine ----------
-  button.tick();
-
-  static int last = -1;
-  int v = digitalRead(BUTTON_PIN);
-  if (v != last) {
-    last = v;
-    Serial.printf("read=%d\n", v);
+#if BUTTON_USE_A0
+  if (buttonA0Ready) {
+    tickButtonA0(nowMs);
   }
-  delay(5);
+#else
+  if (buttonReady) {
+    button.tick();
+
+    static int last = -1;
+    int v = digitalRead(BUTTON_PIN);
+    if (v != last) {
+      last = v;
+      Serial.printf("read=%d\n", v);
+    }
+    delay(5);
+  }
+#endif
 
   // Roll screens on short-press request
   if (nextScreenReq) {
@@ -2968,6 +4166,14 @@ void loop() {
     lastFast30mDraw = 0;
     lastRedraw      = 0;
 
+    drawAllScreens();
+    screenWakeReq = false; // draw covers wake-up redraw too
+  }
+
+  if (screenWakeReq && !screenOff) {
+    screenWakeReq = false;
+    lastFast30mDraw = 0;
+    lastRedraw      = 0;
     drawAllScreens();
   }
 
@@ -2989,7 +4195,7 @@ void loop() {
     currentMinute = ((nowMs - softStartTime) / 60000UL) % 1440;
   }
 
-  const int slot = currentMinute / 5;
+  const int slot = currentMinute / SLOT_MINUTES;
 
   if (currentSlot == -1) {
     currentSlot   = slot;
@@ -3022,11 +4228,11 @@ void loop() {
       slotsSince12hReset++;
       slotsSince24hReset++;
 
-      if (slotsSince12hReset >= 144) { // 12h @ 5-min slots
+      if (slotsSince12hReset >= SLOTS_PER_12H) { // 12h @ SLOT_MINUTES bins
         slotsSince12hReset = 0;
         twelveGraphResetOriginSlot = currentSlot;
       }
-      if (slotsSince24hReset >= 288) { // 24h @ 5-min slots
+      if (slotsSince24hReset >= SLOTS_PER_24H) { // 24h @ SLOT_MINUTES bins
         slotsSince24hReset = 0;
         twentyFourGraphResetOriginSlot = currentSlot;
       }
@@ -3036,7 +4242,7 @@ void loop() {
     lastDrawnSlot = slot;
 
     // Redraw on slot change
-    drawAllScreens();
+    if (!screenOff) drawAllScreens();
   }
 
   // ---------- Sensor read / watchdog ----------
@@ -3045,61 +4251,103 @@ void loop() {
   }
 
   bool gotSample = false;
+  bool tempHumSampled = false;
+  bool co2Sampled = false;
+  int co2Ppm = -1;
 
   if (scd30.dataReady()) {
     if (scd30.read()) {
-      lastSensorData = nowMs;
-
       const float c = scd30.CO2;
       const float t = scd30.temperature;
       const float h = scd30.relative_humidity;
 
-      if (c > 0 && c < 10000 && t > -20 && t < 80 && h >= 0 && h <= 100) {
-        currentCO2  = c;
+      if (c > CO2_MIN_PPM && c < CO2_MAX_PPM && t > -10 && t < 60 && h >= 0 && h <= 100) {
+        int adj = (int)(c + 0.5f) + (int)co2OffsetPpm;
+        if (adj < 0) adj = 0;
+        if (adj > 65535) adj = 65535;
+
+        co2Ppm = adj;
+        currentCO2 = (float)co2Ppm;
         currentTemp = t;
         currentHum  = h;
-        gotSample = true;
+
+        tempHumSampled = true;
+        co2Sampled = true;
+        lastSensorData = nowMs;
       }
     }
   }
 
   // Accumulate ONLY when we got a real sample
-  if (gotSample) {
-    co2Sum  += (uint32_t)(currentCO2 + 0.5f);
+  if (tempHumSampled) {
     tempSum += (uint32_t)(currentTemp * 10.0f + 0.5f);
     humSum  += (uint32_t)(currentHum  * 10.0f + 0.5f);
     sampleCount++;
+    gotSample = true;
+  }
 
+  if (co2Sampled) {
+    co2Sum += (uint32_t)(co2Ppm);
+    co2SampleCount++;
+    gotSample = true;
+  }
+
+  if (gotSample) {
     writeLiveSlotPreviewToBuffers();
   }
+// ---------- AC Control (HTTP) ----------
+#if ENABLE_AC_HTTP
+  tickAcControl();
+#endif
+
+// ---------- Battery read ----------
+#if ENABLE_LDR_SLEEP
+  handleLdrAndSleep(nowMs); // uses A0; battery reading disabled when LDR sleep is enabled
+#else
+#if ENABLE_BATTERY_READ
+  if (nowMs - lastBatteryReadMs >= BATTERY_READ_INTERVAL_MS) {
+    lastBatteryReadMs = nowMs;
+    float v = readBatteryVolts();
+    if (!isnan(v)) {
+      if (isnan(batteryV)) batteryV = v;
+      else batteryV = batteryV * 0.7f + v * 0.3f; // light smoothing
+    }
+  }
+#endif
+#endif
 
 #if ENABLE_FS
   // Periodic save so restart still has data even within the same 5-min slot
-  if (fsReady && (nowMs - lastPeriodicSaveMs >= PERIODIC_SAVE_MS)) {
+  if (fsReady && initialDataLoaded && (nowMs - lastPeriodicSaveMs >= PERIODIC_SAVE_MS)) {
     saveDataToFS(false);
     lastPeriodicSaveMs = nowMs;
   }
 #endif
 
   // ---------- Display refresh ----------
-  // Fast refresh on 30m screen (lighter)
-  if (screenMode == 0 && (nowMs - lastFast30mDraw >= FAST_30M_REFRESH_MS)) {
-    lastFast30mDraw = nowMs;
-    drawHeader();
-    drawTabs();
-    draw30MinDashboard();
-  }
+  if (!screenOff) {
+    // Fast refresh on 30m screen (lighter)
+    if (screenMode == 0 && (nowMs - lastFast30mDraw >= FAST_30M_REFRESH_MS)) {
+      lastFast30mDraw = nowMs;
+      drawHeader();
+      drawTabs();
+      draw30MinDashboard();
+    }
 
-  // Slower full refresh on other screens
-  if (screenMode != 0 && (nowMs - lastRedraw >= REDRAW_INTERVAL)) {
-    lastRedraw = nowMs;
-    drawAllScreens();
+    // Slower full refresh on other screens
+    if (screenMode != 0 && (nowMs - lastRedraw >= REDRAW_INTERVAL)) {
+      lastRedraw = nowMs;
+      drawAllScreens();
+    }
   }
 
   // Keep WDT happy but stay responsive
   yield();
-  delay(10);
+  delay(screenOff ? 60 : 10);
 }
+
+
+
 
 
 
