@@ -76,10 +76,10 @@
 #endif
 
 #ifndef DEFAULT_WIFI_SSID
-  #define DEFAULT_WIFI_SSID "VX220-C1DD"
+  #define DEFAULT_WIFI_SSID "WIFISSID"
 #endif
 #ifndef DEFAULT_WIFI_PASS
-  #define DEFAULT_WIFI_PASS "speeduino11"
+  #define DEFAULT_WIFI_PASS "WIFIPASSWORD"
 #endif
 
 // ===================== AC Control (HTTP) =====================
