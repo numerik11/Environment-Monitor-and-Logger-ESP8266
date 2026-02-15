@@ -1,6 +1,6 @@
 /*********************************************************
  * Environment Monitor (ESP8266 D1 R1 + ILI9341 + SCD30)
- * - 5-min slots (288/day), LittleFS persistence
+ * - 4-min slots (360/day), LittleFS persistence
  * - Web UI: 30-day history + Today (live)
  *
  * Button (NC to GND):
@@ -120,7 +120,10 @@ struct AxisScale { float vmin; float vmax; float step; int tickCount; float tick
 Adafruit_SCD30 scd30;
 
 // ===================== Data buffers =====================
-static const int SLOTS_PER_DAY = 288; // 5-min bins
+#define SLOT_MINUTES 4
+static const int SLOTS_PER_DAY  = 1440 / SLOT_MINUTES;
+static const int SLOTS_PER_12H  = (12 * 60) / SLOT_MINUTES;
+static const int SLOTS_PER_24H  = (24 * 60) / SLOT_MINUTES;
 
 static uint16_t co2Slots[SLOTS_PER_DAY];
 static uint8_t  tempSlots[SLOTS_PER_DAY];
@@ -359,7 +362,7 @@ static void drawNowMarkerAndTag(int gx0,int gx1,int gy0,int gy1){
 }
 
 static void formatSlotTimeHHMM(int slot, char* out, size_t n){
-  int mins = slot*5;
+  int mins = slot * SLOT_MINUTES;
   int hh = (mins/60)%24;
   int mm = mins%60;
   snprintf(out,n,"%02d:%02d",hh,mm);
@@ -530,7 +533,7 @@ static void drawMiniGraphU16(const Panel& p, const uint16_t* buf, uint16_t lineC
   drawCard(p);
   GridRect g=gridRect(p);
 
-  int slots = max(2, minutesSpan/5);
+  int slots = max(2, minutesSpan / SLOT_MINUTES);
   int end   = max(0, min(currentSlot, SLOTS_PER_DAY-1));
   int start = max(0, end-(slots-1));
   int N     = max(2, end-start+1);
@@ -594,7 +597,7 @@ static void drawMiniGraphU8(const Panel& p, const uint8_t* buf, uint16_t lineCol
   drawCard(p);
   GridRect g=gridRect(p);
 
-  int slots = max(2, minutesSpan/5);
+  int slots = max(2, minutesSpan / SLOT_MINUTES);
   int end   = max(0, min(currentSlot, SLOTS_PER_DAY-1));
   int start = max(0, end-(slots-1));
   int N     = max(2, end-start+1);
@@ -1015,13 +1018,13 @@ static void drawCO212Hour(){
   const GridRect g = gridRect(half);
   drawTimeGrid12h(g.gx0, g.gx1, g.gy0, g.gy1);
 
-  const int baseStart = max(0, currentSlot - 143);
+  const int baseStart = max(0, currentSlot - (SLOTS_PER_12H - 1));
   int dispStart = (twelveGraphResetOriginSlot >= 0) ? max(baseStart, twelveGraphResetOriginSlot) : baseStart;
 
   int count = max(0, currentSlot - dispStart + 1);
-  if (count > 144) count = 144;
+  if (count > SLOTS_PER_12H) count = SLOTS_PER_12H;
 
-  static uint16_t buf[144];
+  static uint16_t buf[SLOTS_PER_12H];
   memset(buf, 0, sizeof(buf));
   for (int i = 0; i < count; ++i) {
     int idx = dispStart + i;
@@ -1048,7 +1051,7 @@ static void drawCO212Hour(){
     tft.print(lab);
   }
 
-  static int xs[144], ys[144];
+  static int xs[SLOTS_PER_12H], ys[SLOTS_PER_12H];
   int segLen = 0, lastIdx = -9999;
 
   auto flush = [&](){ if (segLen >= 2) drawSegmentedLine(xs, ys, segLen, COL_CO2); segLen = 0; };
@@ -1096,7 +1099,7 @@ static void drawTempHum12Hour(){
   const int availH=SCREEN_HEIGHT-(contentTop+UI_BOTTOM_MARGIN);
   const int eachH=(availH-UI_GUTTER)/2;
 
-  const int baseStart = max(0, currentSlot - 143);
+  const int baseStart = max(0, currentSlot - (SLOTS_PER_12H - 1));
   const int dispStart = (twelveGraphResetOriginSlot >= 0) ? max(baseStart, twelveGraphResetOriginSlot) : baseStart;
 
   // Temperature
@@ -1111,9 +1114,9 @@ static void drawTempHum12Hour(){
   drawTimeGrid12h(g.gx0,g.gx1,g.gy0,g.gy1);
 
   int countT = max(0, currentSlot - dispStart + 1);
-  if (countT > 144) countT = 144;
+  if (countT > SLOTS_PER_12H) countT = SLOTS_PER_12H;
 
-  static uint8_t bufT[144];
+  static uint8_t bufT[SLOTS_PER_12H];
   memset(bufT,0,sizeof(bufT));
   for(int i=0;i<countT;i++){ int idx=dispStart+i; if(idx>=0 && idx<SLOTS_PER_DAY) bufT[i]=tempSlots[idx]; }
 
@@ -1125,7 +1128,7 @@ static void drawTempHum12Hour(){
   }
   AxisScale ts=computeAxisScale(tany?tmin:10.f, tany?tmax:40.f, 10.f, 40.f, 5);
 
-  static int xs[144], ys[144];
+  static int xs[SLOTS_PER_12H], ys[SLOTS_PER_12H];
   int segLen=0, lastIdx=-9999;
   auto flush=[&](){ if(segLen>=2) drawSegmentedLine(xs, ys, segLen, COL_TEMP); segLen=0; };
   auto push=[&](int i, float v){
@@ -1168,9 +1171,9 @@ static void drawTempHum12Hour(){
   drawTimeGrid12h(g.gx0,g.gx1,g.gy0,g.gy1);
 
   int countH = max(0, currentSlot - dispStart + 1);
-  if (countH > 144) countH = 144;
+  if (countH > SLOTS_PER_12H) countH = SLOTS_PER_12H;
 
-  static uint8_t bufH[144];
+  static uint8_t bufH[SLOTS_PER_12H];
   memset(bufH,0,sizeof(bufH));
   for(int i=0;i<countH;i++){ int idx=dispStart+i; if(idx>=0 && idx<SLOTS_PER_DAY) bufH[i]=humSlots[idx]; }
 
@@ -1182,7 +1185,7 @@ static void drawTempHum12Hour(){
   }
   AxisScale hs=computeAxisScale(hany?hmin:20.f, hany?hmax:80.f, 20.f, 80.f, 5);
 
-  static int xs2[144], ys2[144];
+  static int xs2[SLOTS_PER_12H], ys2[SLOTS_PER_12H];
   int segLen2=0; lastIdx=-9999;
   auto flush2=[&](){ if(segLen2>=2) drawSegmentedLine(xs2, ys2, segLen2, COL_HUM); segLen2=0; };
   auto push2=[&](int i, float v){
@@ -2211,7 +2214,7 @@ canvas{
     rC.textContent=(C.mn!=null)?`Min ${Math.round(C.mn)} · Max ${Math.round(C.mx)}`:"Min — · Max —";
     rT.textContent=(T.mn!=null)?`Min ${Number(T.mn).toFixed(1)} · Max ${Number(T.mx).toFixed(1)}`:"Min — · Max —";
     rH.textContent=(H.mn!=null)?`Min ${Math.round(H.mn)} % · Max ${Math.round(H.mx)} %`:"Min — · Max —";
-    const n=(data.slots||co2.length||288);
+    const n=(data.slots||co2.length||360);
     info.textContent=`Samples ${Math.max(C.c,T.c,H.c)}/${n}`;
   }
 
@@ -2797,14 +2800,14 @@ static void handleToday() {
   auto sendS = [&](const String& s) { server.sendContent(s); yield(); };
   auto sendC = [&](const char* s)   { server.sendContent(s); yield(); };
 
-  const int SLOT_MINUTES = 5;
+  const int slotMinutes = SLOT_MINUTES;
   const unsigned long nowEpoch = (unsigned long)approxNow();
   const int slot = currentSlot;
-  const int minuteOfDay = (slot < 0) ? 0 : slot * SLOT_MINUTES;
+  const int minuteOfDay = (slot < 0) ? 0 : slot * slotMinutes;
 
   sendC("{");
   sendC("\"name\":\"__TODAY__\""); // (nice for UI / stats handler)
-  sendC(",\"stepMin\":");       sendS(String(SLOT_MINUTES));
+  sendC(",\"stepMin\":");       sendS(String(slotMinutes));
   sendC(",\"slots\":");         sendS(String(SLOTS_PER_DAY));
   sendC(",\"epoch\":");         sendS(String(nowEpoch));
   sendC(",\"slot\":");          sendS(String(slot));
@@ -2942,10 +2945,10 @@ static void handleDayData() {
   auto sendS = [&](const String& s) { server.sendContent(s); yield(); };
   auto sendC = [&](const char* s)   { server.sendContent(s); yield(); };
 
-  const int SLOT_MINUTES = 5;
+  const int slotMinutes = SLOT_MINUTES;
 
   sendC("{\"name\":\""); sendS(name);
-  sendC("\",\"stepMin\":"); sendS(String(SLOT_MINUTES));
+  sendC("\",\"stepMin\":"); sendS(String(slotMinutes));
   sendC(",\"slots\":"); sendS(String(SLOTS_PER_DAY));
 
   sendC(",\"co2\":[");
@@ -3104,7 +3107,7 @@ void loop() {
     currentMinute = ((nowMs - softStartTime) / 60000UL) % 1440;
   }
 
-  const int slot = currentMinute / 5;
+  const int slot = currentMinute / SLOT_MINUTES;
 
   if (currentSlot == -1) {
     currentSlot   = slot;
@@ -3137,11 +3140,11 @@ void loop() {
       slotsSince12hReset++;
       slotsSince24hReset++;
 
-      if (slotsSince12hReset >= 144) { // 12h @ 5-min slots
+      if (slotsSince12hReset >= SLOTS_PER_12H) { // 12h @ SLOT_MINUTES bins
         slotsSince12hReset = 0;
         twelveGraphResetOriginSlot = currentSlot;
       }
-      if (slotsSince24hReset >= 288) { // 24h @ 5-min slots
+      if (slotsSince24hReset >= SLOTS_PER_24H) { // 24h @ SLOT_MINUTES bins
         slotsSince24hReset = 0;
         twentyFourGraphResetOriginSlot = currentSlot;
       }
@@ -3189,7 +3192,7 @@ void loop() {
   }
 
 #if ENABLE_FS
-  // Periodic save so restart still has data even within the same 5-min slot
+  // Periodic save so restart still has data even within the same slot
   if (fsReady && (nowMs - lastPeriodicSaveMs >= PERIODIC_SAVE_MS)) {
     saveDataToFS(false);
     lastPeriodicSaveMs = nowMs;
