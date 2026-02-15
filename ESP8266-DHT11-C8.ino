@@ -1,7 +1,8 @@
 /*********************************************************
- * Environment Monitor (ESP8266 D1 mini + 170x320 TFT + DHT11)
+ * Environment Monitor (ESP8266 D1 mini + 170x320 TFT + C8 + DHT11)
  * - 2-min slots (720/day), LittleFS persistence
  * - Web UI: 30-day history + Today (live)
+ * - Access Web UI/Log in AP Mode if no wifi or connection lost. 
  *
  * Button (NO to GND):
  *  - Not pressed: pin HIGH (INPUT_PULLUP)
@@ -75,10 +76,22 @@
 #endif
 
 #ifndef DEFAULT_WIFI_SSID
-  #define DEFAULT_WIFI_SSID "VX220-C1DD"
+  #define DEFAULT_WIFI_SSID "WIFI_SSID"
 #endif
 #ifndef DEFAULT_WIFI_PASS
-  #define DEFAULT_WIFI_PASS "speeduino11"
+  #define DEFAULT_WIFI_PASS "WIFI_PASSWORD"
+#endif
+#ifndef AP_FALLBACK_SSID
+  #define AP_FALLBACK_SSID "EnvMonitor"
+#endif
+#ifndef AP_FALLBACK_PASS
+  #define AP_FALLBACK_PASS ""
+#endif
+#ifndef WIFI_STA_CONNECT_TIMEOUT_MS
+  #define WIFI_STA_CONNECT_TIMEOUT_MS 8000UL
+#endif
+#ifndef WIFI_STA_RETRY_MS
+  #define WIFI_STA_RETRY_MS 30000UL
 #endif
 
 // ===================== AC Control (HTTP) =====================
@@ -369,6 +382,10 @@ static bool initialDataLoaded = false;
 static bool offlineMode=false;
 static uint32_t softStartTime=0;
 static uint8_t screenMode=0;
+static bool apFallbackActive = false;
+static bool mdnsStarted = false;
+static uint32_t lastStaRetryMs = 0;
+static bool otaReady = false;
 
 // ----- Offline time anchor -----
 static time_t   timeAnchorEpoch   = 0;
@@ -393,6 +410,9 @@ static void anchorTimeToNow();
 static time_t approxNow();
 static void applyTimeZone();
 static void requestTimeSync(bool waitForSync);
+static void startFallbackAP();
+static void onStaConnected();
+static void retryStaWhileAp();
 
 static void resetAccumulators();
 static void commitSlotData(int slot);
@@ -2187,40 +2207,45 @@ static bool initSensor() {
 }
 
 // ===================== Network / Time =====================
-static void connectWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.hostname(OTA_HOSTNAME);
+static void startFallbackAP() {
+  WiFi.disconnect(false);
+  WiFi.mode(WIFI_AP_STA);
 
-  WiFiManager wm;
-  wm.setConfigPortalTimeout(120);
-  wm.setConfigPortalBlocking(true);
+  bool apOk = false;
+  if (AP_FALLBACK_PASS[0] != '\0') apOk = WiFi.softAP(AP_FALLBACK_SSID, AP_FALLBACK_PASS);
+  else                             apOk = WiFi.softAP(AP_FALLBACK_SSID);
 
-  bool ok = false;
-  if (DEFAULT_WIFI_SSID[0] != '\0') {
-    WiFi.begin(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASS);
-    uint32_t startMs = millis();
-    while (WiFi.status() != WL_CONNECTED && (millis() - startMs) < 8000) {
-      delay(200);
-      yield();
-    }
-    ok = (WiFi.status() == WL_CONNECTED);
-  }
-  if (!ok) {
-    ok = wm.autoConnect("EnvMonitor-Setup");
-  }
+  offlineMode = true;
+  if (softStartTime == 0) softStartTime = millis();
+  apFallbackActive = apOk;
 
-  if (!ok) {
-    Serial.println("WiFiManager: failed or timed out -> offline mode");
-    offlineMode   = true;
-    softStartTime = millis();
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
+  if (apOk) {
+    IPAddress apIP = WiFi.softAPIP();
+    dnsServer.start(53, "*", apIP);
+    Serial.print("Fallback AP started: SSID=");
+    Serial.print(AP_FALLBACK_SSID);
+    Serial.print(" IP=");
+    Serial.println(apIP);
   } else {
-    Serial.print("WiFiManager: connected, IP=");
-    Serial.println(WiFi.localIP());
-    offlineMode = false;
+    Serial.println("Fallback AP failed to start");
+  }
+}
 
+static void onStaConnected() {
+  offlineMode = false;
+  Serial.print("WiFi connected, IP=");
+  Serial.println(WiFi.localIP());
+
+  if (apFallbackActive) {
+    dnsServer.stop();
+    WiFi.softAPdisconnect(true);
+    apFallbackActive = false;
+    Serial.println("Fallback AP stopped (STA connected)");
+  }
+
+  if (!mdnsStarted) {
     if (MDNS.begin(OTA_HOSTNAME)) {
+      mdnsStarted = true;
       Serial.print("mDNS responder started: http://");
       Serial.print(OTA_HOSTNAME);
       Serial.println(".local");
@@ -2229,11 +2254,64 @@ static void connectWiFi() {
       Serial.println("mDNS responder FAILED");
     }
   }
+
+#if ENABLE_OTA
+  initOTA();
+#endif
+}
+
+static void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.hostname(OTA_HOSTNAME);
+
+  bool ok = false;
+  if (DEFAULT_WIFI_SSID[0] != '\0') {
+    WiFi.begin(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASS);
+    uint32_t startMs = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - startMs) < WIFI_STA_CONNECT_TIMEOUT_MS) {
+      delay(200);
+      yield();
+    }
+    ok = (WiFi.status() == WL_CONNECTED);
+  }
+  if (!ok) {
+    WiFi.begin(); // try saved creds in SDK flash
+    uint32_t startMs = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - startMs) < WIFI_STA_CONNECT_TIMEOUT_MS) {
+      delay(200);
+      yield();
+    }
+    ok = (WiFi.status() == WL_CONNECTED);
+  }
+
+  if (!ok) {
+    Serial.println("WiFi connect failed -> AP fallback mode");
+    startFallbackAP();
+  } else {
+    onStaConnected();
+  }
+}
+
+static void retryStaWhileAp() {
+  if (!apFallbackActive) return;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    onStaConnected();
+    return;
+  }
+
+  const uint32_t nowMs = millis();
+  if ((uint32_t)(nowMs - lastStaRetryMs) < WIFI_STA_RETRY_MS) return;
+  lastStaRetryMs = nowMs;
+
+  Serial.println("Retrying STA connection while AP is active...");
+  if (DEFAULT_WIFI_SSID[0] != '\0') WiFi.begin(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASS);
+  else                              WiFi.begin();
 }
 
 #if ENABLE_OTA
 static void initOTA() {
-  if (offlineMode || WiFi.status() != WL_CONNECTED) return;
+  if (otaReady || offlineMode || WiFi.status() != WL_CONNECTED) return;
 
   ArduinoOTA.setPort(OTA_PORT);
   ArduinoOTA.setHostname(OTA_HOSTNAME);
@@ -2256,6 +2334,7 @@ static void initOTA() {
   });
 
   ArduinoOTA.begin();
+  otaReady = true;
   Serial.printf("OTA ready: %s:%u\n", OTA_HOSTNAME, (unsigned)OTA_PORT);
 }
 #else
@@ -2294,12 +2373,14 @@ static const char WEB_ROOT_HTML[] PROGMEM = R"HTML(
 :root{
   --bg:#0a1117;--panel:#0f1c26;--panel-2:#122433;--text:#e9f3ff;--muted:rgba(233,243,255,.70);
   --grid:rgba(255,255,255,.10);--stroke:rgba(255,255,255,.12);--btn:rgba(255,255,255,.06);
+  --input-bg:rgba(0,0,0,.16);--input-text:var(--text);
   --accent:#f4c44e;--accent-2:#e48a4d;--co2:#ff7a59;--temp:#4dd6ff;--hum:#9fc0ff;
   --good:#7cd7a8;--warn:#f0c35b;--bad:#f05a5a;--r:18px;
 }
 [data-theme="light"]{
   --bg:#f4f2ee;--panel:#ffffff;--panel-2:#f7f7fb;--text:#131a23;--muted:rgba(19,26,35,.62);
   --grid:rgba(19,26,35,.10);--stroke:rgba(19,26,35,.12);--btn:rgba(19,26,35,.06);
+  --input-bg:#ffffff;--input-text:#000000;
   --accent:#b47a00;--accent-2:#c95b2b;
 }
 *{box-sizing:border-box}html,body{height:100%}
@@ -2383,8 +2464,12 @@ body::before{
 .controls.scroll > *{scroll-snap-align:start}
 .sp{flex:1}
 button,select,input[type=time],label{font:inherit}
-button,select,input[type=time]{
+button{
   height:36px;border-radius:999px;border:1px solid var(--stroke);background:var(--btn);color:var(--text);
+  padding:0 14px;cursor:pointer;touch-action:manipulation;transition:transform .12s ease, background .12s ease
+}
+select,input[type=time]{
+  height:36px;border-radius:999px;border:1px solid var(--stroke);background:var(--input-bg);color:var(--input-text);
   padding:0 14px;cursor:pointer;touch-action:manipulation;transition:transform .12s ease, background .12s ease
 }
 button:hover{background:rgba(255,255,255,.10)}
@@ -2401,7 +2486,7 @@ select{min-width:220px}
 .range.tight input[type=range]{width:90px}
 .range .val{min-width:16px;text-align:right;font-variant-numeric:tabular-nums;opacity:.8}
 .chip.time input[type=time]{
-  height:28px;border-radius:10px;border:1px solid var(--stroke);background:rgba(0,0,0,.16);color:var(--text);
+  height:28px;border-radius:10px;border:1px solid var(--stroke);background:var(--input-bg);color:var(--input-text);
   padding:0 8px
 }
 .chip.stale{opacity:.55}
@@ -2423,6 +2508,11 @@ canvas{
   position:fixed;z-index:50;pointer-events:none;display:none;white-space:nowrap;
   background:rgba(8,10,22,.92);color:var(--text);border:1px solid rgba(255,255,255,.18);
   padding:7px 10px;border-radius:12px;font-size:.86rem
+}
+[data-theme="light"] #tip{
+  background:#ffffff;
+  color:#000000;
+  border:1px solid rgba(19,26,35,.22);
 }
 .fade-in{animation:fadeIn .5s ease both}
 @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
@@ -4106,6 +4196,10 @@ void loop() {
   // ---------- Network tasks ----------
   if (WiFi.getMode() != WIFI_OFF) {
     server.handleClient();
+    if (apFallbackActive) {
+      dnsServer.processNextRequest();
+      retryStaWhileAp();
+    }
     if (WiFi.status() == WL_CONNECTED) {
       MDNS.update();
 #if ENABLE_OTA
