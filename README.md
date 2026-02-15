@@ -8,6 +8,8 @@
   
 - PNG export from the web graph.
 
+- Button to scroll through Stats/12/24hr graphs on screen. Hold button to set co2 reading to 400ppm.
+
                               ===================== Pins. (Wemos D1 R2/Mini) ===================== 
 
 - #define CO2_TX_PIN  D0  // Senseair S8 UART TX (no interrupt needed)
