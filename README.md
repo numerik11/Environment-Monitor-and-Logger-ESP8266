@@ -1,6 +1,10 @@
                                            - Envinroment Monitor (ESP8266 Based) -
 
-- Wi-Fi enabled CO₂ / temperature / humidity monitor using an SCD30 + ILI9341 TFT or 130*320 TFT + Senseair C8 w/DHT11.
+- Wi-Fi enabled CO₂ / temperature / humidity monitor using an -
+
+- SCD30 + ILI9341 TFT or
+
+- 130*320 TFT + Senseair C8 w/DHT11.
   
 - Logs 2-minute samples to LittleFS (30-day rolling history), serves a modern web dashboard with “Today (live)” + zoomable graphs,
   
