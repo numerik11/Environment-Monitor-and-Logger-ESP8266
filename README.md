@@ -4,7 +4,7 @@
 
 - SCD30 + ILI9341 TFT or
 
-- 130*320 TFT + Senseair C8 w/DHT11.
+- 130*320 TFT + NDIR CO2 Sensor(C8) w/DHT11.
   
 - Logs 2-minute samples to LittleFS (30-day rolling history), serves a modern web dashboard with “Today (live)” + zoomable graphs,
   
