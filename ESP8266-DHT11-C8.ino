@@ -1,14 +1,16 @@
 /*********************************************************
- * Environment Monitor (ESP8266 D1 mini + 170x320 TFT + C8 + DHT11)
- * - 2-min slots (720/day), LittleFS persistence
+ * Environment Monitor (ESP8266 D1 mini + 170x320 TFT + C8/DHT11)
+ * - 4-min slots (360/day), LittleFS persistence
  * - Web UI: 30-day history + Today (live)
- * - Access Web UI/Log in AP Mode if no wifi or connection lost. 
  *
  * Button (NO to GND):
  *  - Not pressed: pin HIGH (INPUT_PULLUP)
  *  - Pressed: contact closes, pin LOW (to GND)
  *  - Interrupt on FALLING (HIGH->LOW)
- *  - Short-press: cycle screens (long-press unused)
+ *  - Short-press: cycle screens
+ *  - Long-press:
+ *    - Hold 5s -> shows "Force 400 ppm?" confirm overlay
+ *    - Then short-press within 5s to confirm calibration
 *********************************************************/
 
 #include <Arduino.h>
@@ -76,10 +78,10 @@
 #endif
 
 #ifndef DEFAULT_WIFI_SSID
-  #define DEFAULT_WIFI_SSID "WIFI_SSID"
+  #define DEFAULT_WIFI_SSID "SSID"
 #endif
 #ifndef DEFAULT_WIFI_PASS
-  #define DEFAULT_WIFI_PASS "WIFI_PASSWORD"
+  #define DEFAULT_WIFI_PASS "PASSWORD"
 #endif
 #ifndef AP_FALLBACK_SSID
   #define AP_FALLBACK_SSID "EnvMonitor"
@@ -250,7 +252,7 @@ static DHT dht(DHT_PIN, DHT11);
 static SoftwareSerial s8Serial(CO2_RX_PIN, CO2_TX_PIN); // Senseair S8 UART: RX, TX
 
 // ===================== Data buffers =====================
-#define SLOT_MINUTES 2
+#define SLOT_MINUTES 4
 static const int SLOTS_PER_DAY  = 1440 / SLOT_MINUTES;
 static const int SLOTS_PER_12H  = (12 * 60) / SLOT_MINUTES;
 static const int SLOTS_PER_24H  = (24 * 60) / SLOT_MINUTES;
@@ -436,6 +438,9 @@ static void handleToday();
 static void handlePowerSave();
 #if ENABLE_CO2_OFFSET_HTTP
 static void handleCo2Offset();
+#endif
+#if ENABLE_FS
+static void saveCo2OffsetToFS();
 #endif
 
 #if ENABLE_AC_HTTP
@@ -1757,6 +1762,8 @@ NoButton* NoButton::_instance = nullptr;
 
 static NoButton button;
 static bool buttonReady = false;
+static const uint32_t BUTTON_LONG_PRESS_MS = 5000;
+static const uint32_t BUTTON_CONFIRM_MS = 5000;
 
 #if BUTTON_USE_A0
 static bool buttonA0Ready = false;
@@ -1766,10 +1773,53 @@ static uint32_t lastButtonA0SampleMs = 0;
 static const uint16_t BUTTON_A0_PRESSED_MAX = 200;
 static const uint16_t BUTTON_A0_RELEASE_MIN = 800;
 static const uint16_t BUTTON_A0_SAMPLE_MS = 10;
+static bool buttonA0LongFired = false;
+static bool buttonA0ConfirmPending = false;
+static uint32_t buttonA0ConfirmDeadline = 0;
+
+static void applyForce400Calibration() {
+  if (isnan(currentCO2)) {
+    showToast("Calibration failed: no CO2 sample", COL_WARN, 1200);
+    drawAllScreens();
+    return;
+  }
+
+  int delta = (int)lroundf(400.0f - currentCO2);
+  int next = (int)co2OffsetPpm + delta;
+  next = constrain(next, -500, 500);
+  co2OffsetPpm = (int16_t)next;
+#if ENABLE_FS
+  saveCo2OffsetToFS();
+#endif
+  showToast("Baseline adjusted to 400 ppm", COL_GOOD, 1400);
+  drawAllScreens();
+}
+
+static void onBtnLongRequest() {
+  noteUserActivity(true);
+  drawOverlayBox("Force 400 ppm?", "Press once within 5s to confirm");
+}
+
+static void onBtnConfirm() {
+  noteUserActivity(true);
+  drawOverlayBox("Calibrating...", "Applying offset to 400 ppm");
+  applyForce400Calibration();
+}
+
+static void onBtnConfirmTimeout() {
+  noteUserActivity(true);
+  showToast("Calibration canceled", COL_MUTED, 900);
+  drawAllScreens();
+}
 
 static void tickButtonA0(uint32_t nowMs) {
   if (nowMs - lastButtonA0SampleMs < BUTTON_A0_SAMPLE_MS) return;
   lastButtonA0SampleMs = nowMs;
+
+  if (buttonA0ConfirmPending && nowMs > buttonA0ConfirmDeadline) {
+    buttonA0ConfirmPending = false;
+    onBtnConfirmTimeout();
+  }
 
   int raw = analogRead(A0);
   if (raw < 0) return;
@@ -1778,11 +1828,29 @@ static void tickButtonA0(uint32_t nowMs) {
     if (raw <= BUTTON_A0_PRESSED_MAX) {
       buttonA0Pressed = true;
       buttonA0PressAt = nowMs;
+      buttonA0LongFired = false;
     }
-  } else if (raw >= BUTTON_A0_RELEASE_MIN) {
-    buttonA0Pressed = false;
-    if (nowMs - buttonA0PressAt >= 20) {
-      onBtnShort();
+  } else {
+    if (!buttonA0LongFired && (nowMs - buttonA0PressAt >= BUTTON_LONG_PRESS_MS)) {
+      buttonA0LongFired = true;
+      buttonA0ConfirmPending = true;
+      buttonA0ConfirmDeadline = nowMs + BUTTON_CONFIRM_MS;
+      onBtnLongRequest();
+    }
+
+    if (raw >= BUTTON_A0_RELEASE_MIN) {
+      buttonA0Pressed = false;
+      if (nowMs - buttonA0PressAt >= 20) {
+        if (buttonA0LongFired) {
+          return;
+        }
+        if (buttonA0ConfirmPending) {
+          buttonA0ConfirmPending = false;
+          onBtnConfirm();
+        } else {
+          onBtnShort();
+        }
+      }
     }
   }
 }
@@ -3042,7 +3110,7 @@ canvas{
     rC.textContent=(C.mn!=null)?`Min ${Math.round(C.mn)} - Max ${Math.round(C.mx)}`:"Min -- - Max --";
     rT.textContent=(T.mn!=null)?`Min ${Number(T.mn).toFixed(1)} - Max ${Number(T.mx).toFixed(1)}`:"Min -- - Max --";
     rH.textContent=(H.mn!=null)?`Min ${Math.round(H.mn)} % - Max ${Math.round(H.mx)} %`:"Min -- - Max --";
-    const n=(data.slots||co2.length||720);
+    const n=(data.slots||co2.length||360);
     info.textContent=`Samples ${Math.max(C.c,T.c,H.c)}/${n}`;
   }
 
@@ -4160,7 +4228,8 @@ void setup(){
   if (BUTTON_PIN >= 0) {
     buttonIrq = digitalPinToInterrupt(BUTTON_PIN);
     if (buttonIrq != NOT_AN_INTERRUPT) {
-      button.begin(BUTTON_PIN, onBtnShort, nullptr, nullptr, nullptr, 0, 0);
+      button.begin(BUTTON_PIN, onBtnShort, onBtnLongRequest, onBtnConfirm, onBtnConfirmTimeout,
+                   BUTTON_LONG_PRESS_MS, BUTTON_CONFIRM_MS);
       pinMode(BUTTON_PIN, INPUT_PULLUP);
       buttonReady = true;
     }
