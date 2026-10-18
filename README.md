@@ -18,5 +18,9 @@ The default build uses an SCD30 sensor. An alternative build supports a Senseair
 - **SCD30 (default):** CO₂, temperature and humidity over I²C
 - **Senseair S8 + DHT11:** CO₂ over UART, temperature and humidity from the DHT11.
 
+## Web UI
 
+<img width="860" height="934" alt="image" src="https://github.com/user-attachments/assets/0b53de26-a1b0-4f57-818d-560f70236693" />
+
+<img width="252" height="198" alt="image" src="https://github.com/user-attachments/assets/08b38d1d-55e8-4fad-a237-6e66d1069699" />
 
