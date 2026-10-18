@@ -75,17 +75,17 @@ extern "C" {
   #define ENABLE_OTA 1
 #endif
 #ifndef OTA_HOSTNAME
-  #define OTA_HOSTNAME "envmonitor"
+  #define OTA_HOSTNAME "Envmonitor"
 #endif
 #ifndef OTA_PORT
   #define OTA_PORT 8266
 #endif
 
 #ifndef DEFAULT_WIFI_SSID
-  #define DEFAULT_WIFI_SSID "VX220-C1DD"
+  #define DEFAULT_WIFI_SSID "SSID"
 #endif
 #ifndef DEFAULT_WIFI_PASS
-  #define DEFAULT_WIFI_PASS "speeduino11"
+  #define DEFAULT_WIFI_PASS "password"
 #endif
 #ifndef AP_FALLBACK_SSID
   #define AP_FALLBACK_SSID "EnvMonitor"
