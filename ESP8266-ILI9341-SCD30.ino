@@ -61,7 +61,7 @@
   #define FAN_DIRECT_SSID "espcontrol"
 #endif
 #ifndef FAN_DIRECT_PASSWORD
-  #define FAN_DIRECT_PASSWORD "silvereski"
+  #define FAN_DIRECT_PASSWORD "123456"
 #endif
 
 #if ENABLE_FS
