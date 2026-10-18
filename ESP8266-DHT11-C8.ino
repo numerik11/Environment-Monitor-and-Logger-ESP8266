@@ -1,5 +1,5 @@
 /*********************************************************
- * Environment Monitor (ESP8266 D1 mini + 170x320 TFT + C8/DHT11)
+ * Environment Monitor (ESP8266 D1 mini + 170x320 TFT + DHT11)
  * - 4-min slots (360/day), LittleFS persistence
  * - Web UI: 30-day history + Today (live)
  *
@@ -21,10 +21,14 @@
 #include <ESP8266mDNS.h>
 #include <ArduinoOTA.h>
 #include <ESP8266HTTPClient.h>
+extern "C" {
+#include <user_interface.h>
+}
 #include <time.h>
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
+#include <Adafruit_ILI9341.h>
 #include <DHT.h>
 #include <SoftwareSerial.h>
 
@@ -78,10 +82,10 @@
 #endif
 
 #ifndef DEFAULT_WIFI_SSID
-  #define DEFAULT_WIFI_SSID "SSID"
+  #define DEFAULT_WIFI_SSID "VX220-C1DD"
 #endif
 #ifndef DEFAULT_WIFI_PASS
-  #define DEFAULT_WIFI_PASS "PASSWORD"
+  #define DEFAULT_WIFI_PASS "speeduino11"
 #endif
 #ifndef AP_FALLBACK_SSID
   #define AP_FALLBACK_SSID "EnvMonitor"
@@ -96,12 +100,19 @@
   #define WIFI_STA_RETRY_MS 30000UL
 #endif
 
+// Fan telemetry has its own DHT freshness; CO2 samples cannot refresh it.
+static String fanHost="greenhouse-fan.local";
+static bool fanSendEnabled=true, fanHaveSample=false;
+static uint32_t fanBoot=0, fanSequence=0, fanSampleTime=0, fanLastAttempt=0;
+static int fanLastHttp=0;
+static const char* FAN_SENSOR_KEY="GrowSensor2026";
+
 // ===================== AC Control (HTTP) =====================
 #ifndef ENABLE_AC_HTTP
   #define ENABLE_AC_HTTP 1
 #endif
 #ifndef AC_HTTP_HOST
-  #define AC_HTTP_HOST "ac-control.local"
+  #define AC_HTTP_HOST "192.168.1.127"
 #endif
 #ifndef AC_HTTP_TICK_MS
   #define AC_HTTP_TICK_MS 5000UL
@@ -203,11 +214,13 @@ DNSServer dnsServer;
 static const char* TZ_ADELAIDE = "ACST-9:30ACDT-10:30,M10.1.0/2,M4.1.0/3";
 
 // ===================== TFT =====================
-Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST);
-static const int16_t TFT_RAW_WIDTH  = 170;
-static const int16_t TFT_RAW_HEIGHT = 320;
-static const int16_t SCREEN_WIDTH   = 320; // after rotation
-static const int16_t SCREEN_HEIGHT  = 170;
+Adafruit_ST7789 st7789(TFT_CS, TFT_DC, TFT_RST);
+Adafruit_ILI9341 ili9341(TFT_CS, TFT_DC, TFT_RST);
+static Adafruit_SPITFT* activeTft = &st7789;
+#define tft (*activeTft)
+static uint8_t displayType = 1; // preserve existing ST7789 hardware as default
+static int16_t SCREEN_WIDTH = 320;
+static int16_t SCREEN_HEIGHT = 170;
 
 #define RGB565(r,g,b) (((r&0xF8)<<8)|((g&0xFC)<<3)|((b)>>3))
 static const uint16_t COL_BG        = RGB565(8,10,14);
@@ -384,6 +397,10 @@ static bool initialDataLoaded = false;
 static bool offlineMode=false;
 static uint32_t softStartTime=0;
 static uint8_t screenMode=0;
+static uint8_t screenRotation=3;
+static bool wifiChangePending=false;
+static uint32_t wifiChangeAt=0;
+static String pendingSsid, pendingPassword;
 static bool apFallbackActive = false;
 static bool mdnsStarted = false;
 static uint32_t lastStaRetryMs = 0;
@@ -428,7 +445,6 @@ static void drawCO2FullScreen();
 static void drawTempHumFullScreen();
 static void drawCO212Hour();
 static void drawTempHum12Hour();
-static void updateDashboardBadges();
 
 static void handleWebRoot();
 static void handleDayList();
@@ -941,102 +957,81 @@ static void drawMiniGraphU8(const Panel& p, const uint8_t* buf, uint16_t lineCol
   }
 }
 
-// ===================== Floating badges on 30m page =====================
-static void updateDashboardBadges() {
-  if (screenMode != 0) return;
+static void applyScreenRotation() {
+  tft.setRotation(screenRotation);
+  SCREEN_WIDTH = tft.width();
+  SCREEN_HEIGHT = tft.height();
+  header.w = SCREEN_WIDTH;
+  header.h = SCREEN_WIDTH < SCREEN_HEIGHT ? 48 : 36;
+}
 
-  const int contentTop = header.h + UI_TAB_H + UI_SECTION_TITLE_GAP;
-  const int availH     = SCREEN_HEIGHT - (contentTop + UI_BOTTOM_MARGIN);
-  Panel mainCard = makePanel(UI_PAD_X, contentTop, SCREEN_WIDTH - 2*UI_PAD_X, availH);
-
-  const int padX = 10;
-  const int overlayX = mainCard.x + 6;
-  const int overlayY = mainCard.y + 6;
-  const int overlayH = 22;
-  const int overlayW = mainCard.w - 12;
-  uint16_t bandCol = blendColor(COL_CARD, COL_GRID, 35);
-  tft.fillRoundRect(overlayX, overlayY, overlayW, overlayH, 6, bandCol);
-  tft.drawRoundRect(overlayX, overlayY, overlayW, overlayH, 6, COL_GRID);
-
-  tft.setTextSize(1);
-  tft.setTextColor(COL_MUTED, bandCol);
-  tft.setCursor(overlayX + 6, overlayY + 7);
-  tft.print("LIVE 30m");
-
-  const int baseY = overlayY + 4;
-
-  tft.setTextSize(2);
-  if (!isnan(currentTemp)) {
-    char txt[16]; snprintf(txt, sizeof(txt), "%.1fC", currentTemp);
-    tft.setTextColor(COL_TEMP, bandCol);
-    tft.setCursor(mainCard.x + padX, baseY);
-    tft.print(txt);
-    int8_t tr = u8Trend(tempSlots);
-    if (tr != 0) {
-      int16_t w = (int16_t)strlen(txt) * 6 * 2;
-      int16_t ax = mainCard.x + padX + w + 4;
-      int16_t ay = baseY + 4;
-      drawModernTrendIndicator(ax, ay, tr, (tr > 0) ? COL_WARN : COL_GOOD);
-    }
+static void initDisplay() {
+  if (displayType == 1) {
+    activeTft = &st7789;
+    st7789.init(170, 320);
+  } else {
+    activeTft = &ili9341;
+    ili9341.begin();
   }
-  if (!isnan(currentCO2)) {
-    char txt[16]; snprintf(txt, sizeof(txt), "%.0f", currentCO2);
-    // Center CO2, add "ppm" label, then trend arrow
-    int16_t wNum   = (int16_t)strlen(txt) * 6 * 2;
-    int16_t wLabel = 18; // "ppm" at size 1
-    int16_t wArrow = 8;  // 6px glyph + 2px gap
-    int16_t wTotal = wNum + wLabel + wArrow;
-    int16_t x = mainCard.x + (mainCard.w - wTotal) / 2;
-    tft.setTextColor(COL_CO2, bandCol);
-    tft.setCursor(x, baseY);
-    tft.print(txt);
-    tft.setTextSize(1);
-    tft.setCursor(x + wNum, baseY + 2);
-    tft.print("ppm");
-    tft.setTextSize(2);
-    int8_t tr = co2Trend();
-    if (tr != 0) {
-      int16_t ax = x + wNum + wLabel + 2;
-      int16_t ay = baseY + 4;
-      drawModernTrendIndicator(ax, ay, tr, (tr > 0) ? COL_WARN : COL_GOOD);
-    }
-  }
-  if (!isnan(currentHum)) {
-    char txt[16]; snprintf(txt, sizeof(txt), "%.0f%%", currentHum);
-    int16_t w = (int16_t)strlen(txt) * 6 * 2;
-    tft.setTextColor(COL_HUM, bandCol);
-    tft.setCursor(mainCard.x + mainCard.w - padX - w, baseY);
-    tft.print(txt);
-    int8_t tr = u8Trend(humSlots);
-    if (tr != 0) {
-      int16_t ax = mainCard.x + mainCard.w - padX - w - 12;
-      int16_t ay = baseY + 4;
-      drawModernTrendIndicator(ax, ay, tr, (tr > 0) ? COL_WARN : COL_GOOD);
-    }
+  applyScreenRotation();
+}
+
+// ===================== Three-card 30-minute dashboard =====================
+static void drawDashboardCard(const Panel& p, uint8_t metric) {
+  const uint16_t color=metric==0?COL_TEMP:metric==1?COL_HUM:COL_CO2;
+  const float live=metric==0?currentTemp:metric==1?currentHum:currentCO2;
+  const char* label=metric==0?"TEMP":metric==1?"HUMIDITY":"CO2";
+  drawCard(p);
+  tft.setTextWrap(false);
+  tft.setTextSize(1); tft.setTextColor(COL_MUTED,COL_CARD);
+  tft.setCursor(p.x+6,p.y+4); tft.print(label);
+  char value[24];
+  if(!isfinite(live)) snprintf(value,sizeof(value),"--");
+  else if(metric==0) snprintf(value,sizeof(value),"%.1fC",live);
+  else if(metric==1) snprintf(value,sizeof(value),"%.0f%%",live);
+  else snprintf(value,sizeof(value),"%.0f ppm",live);
+  const uint8_t size=p.w>=int(strlen(value))*12+12?2:1;
+  tft.setTextSize(size); tft.setTextColor(color,COL_CARD);
+  tft.setCursor(p.x+6,p.y+15); tft.print(value);
+
+  // Separate sparklines leave the values unobscured, even on the 320x170 TFT.
+  const int x0=p.x+6,x1=p.x+p.w-7,y0=p.y+33,y1=p.y+p.h-5;
+  if(y1<=y0 || currentSlot<0) return;
+  const int end=min(currentSlot,SLOTS_PER_DAY-1);
+  const int windowSlots=(30+SLOT_MINUTES-1)/SLOT_MINUTES;
+  const int start=max(0,end-windowSlots+1);
+  auto reading=[&](int i)->float {
+    if(metric==2) return co2Slots[i]?float(co2Slots[i]):NAN;
+    const uint8_t raw=metric==0?tempSlots[i]:humSlots[i];
+    return raw?(metric==0?decodeTemp(raw):decodeHum(raw)):NAN;
+  };
+  float low=1e9f,high=-1e9f;
+  for(int i=start;i<=end;++i) { const float v=reading(i); if(isfinite(v)){low=min(low,v);high=max(high,v);} }
+  tft.drawFastHLine(x0,y1,x1-x0+1,COL_GRID);
+  if(low>high) return;
+  const float pad=metric==2?25.0f:metric==1?2.0f:0.5f;
+  low-=pad; high+=pad;
+  int previousX=-1,previousY=0;
+  for(int i=start;i<=end;++i) {
+    const float v=reading(i);
+    if(!isfinite(v)) {previousX=-1;continue;}
+    const int x=x1-(end-i)*(x1-x0)/(windowSlots-1);
+    const int y=constrain(y1-int((v-low)*(y1-y0)/(high-low)),y0,y1);
+    if(previousX>=0) tft.drawLine(previousX,previousY,x,y,color);
+    else tft.drawPixel(x,y,color);
+    previousX=x; previousY=y;
   }
 }
 
-// ===================== Pages =====================
 static void draw30MinDashboard() {
-  const int contentTop = header.h + UI_TAB_H + UI_SECTION_TITLE_GAP;
-  const int availH = SCREEN_HEIGHT - (contentTop + UI_BOTTOM_MARGIN);
-
-  Panel mainCard = makePanel(UI_PAD_X, contentTop, SCREEN_WIDTH - 2*UI_PAD_X, availH);
-
-  // Frame
-  tft.fillRoundRect(mainCard.x+2, mainCard.y+2, mainCard.w, mainCard.h, 8, COL_GRID);
-  drawCard(mainCard);
-
-  const int graphTop = mainCard.y + 4;
-  const int graphH = mainCard.h - 8;
-  Panel graph = makePanel(mainCard.x + 4, graphTop, mainCard.w - 8, graphH);
-
-  // base graph (temp) with frame/grid
-  drawMiniGraphU8(graph, tempSlots, COL_TEMP, encodeTemp(0), encodeTemp(100), "", "", currentTemp, decodeTemp, 36, false, false, true, true, true);
-  // overlay humidity on same axes
-  drawMiniGraphU8(graph, humSlots, COL_HUM, encodeHum(0), encodeHum(100), "", "", currentHum, decodeHum, 36, false, false, true, true, true);
-
-  updateDashboardBadges();
+  const int top=header.h+UI_TAB_H+UI_SECTION_TITLE_GAP;
+  const int width=SCREEN_WIDTH-2*UI_PAD_X;
+  const int height=SCREEN_HEIGHT-top-UI_BOTTOM_MARGIN;
+  const int topHeight=(height-UI_GUTTER)/2;
+  const int leftWidth=(width-UI_GUTTER)/2;
+  drawDashboardCard(makePanel(UI_PAD_X,top,leftWidth,topHeight),0);
+  drawDashboardCard(makePanel(UI_PAD_X+leftWidth+UI_GUTTER,top,width-leftWidth-UI_GUTTER,topHeight),1);
+  drawDashboardCard(makePanel(UI_PAD_X,top+topHeight+UI_GUTTER,width,height-topHeight-UI_GUTTER),2);
 }
 
 static void drawWiFiIcon(int16_t x, int16_t y, uint8_t bars, uint16_t col){
@@ -1059,17 +1054,18 @@ static void drawHeader(){
   int16_t tw = (int)strlen(title)*6;
   tft.setCursor((SCREEN_WIDTH - tw)/2, 8); tft.print(title);
 
+  const int clockY = SCREEN_WIDTH < SCREEN_HEIGHT ? 24 : 6;
   time_t ts = approxNow();
   if (ts > 0) {
     struct tm ti; localtime_r(&ts, &ti);
     char buf[6];
     snprintf(buf, sizeof(buf), "%02d:%02d", ti.tm_hour, ti.tm_min);
     tft.setTextSize(2); tft.setTextColor(COL_ACCENT, COL_CARD);
-    tft.setCursor(UI_PAD_X, 6);
+    tft.setCursor(UI_PAD_X, clockY);
     tft.print(buf);
   } else {
     tft.setTextSize(2); tft.setTextColor(COL_MUTED, COL_CARD);
-    tft.setCursor(UI_PAD_X, 6);
+    tft.setCursor(UI_PAD_X, clockY);
     tft.print("--:--");
   }
 
@@ -1090,16 +1086,17 @@ static void drawHeader(){
 static void drawTabs(){
   static const char* names[NUM_SCREENS] = {"30m", "STATS", "24h", "12h"};
   const int y = header.h + 2;
+  const int tabWidth=(SCREEN_WIDTH-2*UI_PAD_X)/NUM_SCREENS;
   int x = UI_PAD_X;
   for(int i=0;i<NUM_SCREENS;i++){
-    int w = (int)strlen(names[i]) * 6 + 16;
+    int w = tabWidth-2;
     bool active=(i==screenMode);
     uint16_t bg = active ? COL_ACCENT : COL_CARD;
     uint16_t fg = active ? COL_BG     : COL_MUTED;
     tft.fillRoundRect(x, y, w, UI_TAB_H-2, 6, bg);
     tft.setTextSize(1); tft.setTextColor(fg, bg);
-    tft.setCursor(x+6, y+6); tft.print(names[i]);
-    x += w + 6;
+    tft.setCursor(x+(w-strlen(names[i])*6)/2, y+5); tft.print(names[i]);
+    x += tabWidth;
   }
 }
 
@@ -1578,8 +1575,12 @@ static void drawAllScreens() {
 
         tft.setCursor(p.x+12, p.y+32);
         if(d.count){
-          char line[46];
-          snprintf(line,sizeof(line),"L: %s @ %s  H: %s @ %s", lowStr,lowTime, highStr,highTime);
+          char line[80];
+          if (SCREEN_WIDTH < SCREEN_HEIGHT) {
+            snprintf(line,sizeof(line),"L: %s @ %s",lowStr,lowTime);
+            tft.print(line); tft.setCursor(p.x+12,p.y+44);
+            snprintf(line,sizeof(line),"H: %s @ %s",highStr,highTime);
+          } else snprintf(line,sizeof(line),"L: %s @ %s  H: %s @ %s", lowStr,lowTime, highStr,highTime);
           tft.print(line);
         }else{
           tft.setTextColor(COL_MUTED, COL_CARD);
@@ -1600,7 +1601,7 @@ static void drawAllScreens() {
       tft.setCursor(UI_PAD_X, SCREEN_HEIGHT-footerH);
       if(totalReadings>0){
         char s[44];
-        snprintf(s,sizeof(s),"%d readings - %d%% complete", totalReadings/2, (totalReadings*100)/(SLOTS_PER_DAY*2));
+        snprintf(s,sizeof(s),"%d samples - %d%%", totalReadings/2, (totalReadings*100)/(SLOTS_PER_DAY*2));
         tft.print(s);
       } else {
         tft.print("No data available");
@@ -2332,25 +2333,21 @@ static void connectWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.hostname(OTA_HOSTNAME);
 
-  bool ok = false;
-  if (DEFAULT_WIFI_SSID[0] != '\0') {
+  // Use saved web configuration; factory credentials only seed an unconfigured device.
+  WiFi.persistent(false);
+  if (WiFi.SSID().length() == 0 && DEFAULT_WIFI_SSID[0] != '\0') {
+    WiFi.persistent(true);
     WiFi.begin(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASS);
-    uint32_t startMs = millis();
-    while (WiFi.status() != WL_CONNECTED && (millis() - startMs) < WIFI_STA_CONNECT_TIMEOUT_MS) {
-      delay(200);
-      yield();
-    }
-    ok = (WiFi.status() == WL_CONNECTED);
+    WiFi.persistent(false);
+  } else {
+    WiFi.begin();
   }
-  if (!ok) {
-    WiFi.begin(); // try saved creds in SDK flash
-    uint32_t startMs = millis();
-    while (WiFi.status() != WL_CONNECTED && (millis() - startMs) < WIFI_STA_CONNECT_TIMEOUT_MS) {
-      delay(200);
-      yield();
-    }
-    ok = (WiFi.status() == WL_CONNECTED);
+  uint32_t startMs = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - startMs) < WIFI_STA_CONNECT_TIMEOUT_MS) {
+    delay(200);
+    yield();
   }
+  bool ok = WiFi.status() == WL_CONNECTED;
 
   if (!ok) {
     Serial.println("WiFi connect failed -> AP fallback mode");
@@ -2373,8 +2370,7 @@ static void retryStaWhileAp() {
   lastStaRetryMs = nowMs;
 
   Serial.println("Retrying STA connection while AP is active...");
-  if (DEFAULT_WIFI_SSID[0] != '\0') WiFi.begin(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASS);
-  else                              WiFi.begin();
+  WiFi.begin(); // retry credentials saved in SDK flash
 }
 
 #if ENABLE_OTA
@@ -2431,6 +2427,173 @@ static bool isTimeValid() {
 }
 
 //  -----   Web UI  --------
+
+// Display preferences are separate from history files. Replace atomically.
+static bool saveScreenSettings(uint8_t page, uint8_t rotation, uint16_t brightness, uint8_t type) {
+#if ENABLE_FS
+  if (!fsReady) return false;
+  File f = LittleFS.open("/screen.tmp", "w");
+  if (!f) return false;
+  String data = String(page) + " " + String(rotation) + " " + String(brightness) + " " + String(type) + "\n";
+  bool ok = f.print(data) == data.length();
+  f.close();
+  return ok && LittleFS.rename("/screen.tmp", "/screen.cfg");
+#else
+  return false;
+#endif
+}
+
+static void loadScreenSettings() {
+#if ENABLE_FS
+  if (!fsReady) return;
+  File f = LittleFS.open("/screen.cfg", "r");
+  if (!f) return;
+  unsigned page, rotation, brightness, type=1;
+  String data = f.readStringUntil('\n');
+  f.close();
+  if (sscanf(data.c_str(), "%u %u %u %u", &page, &rotation, &brightness, &type) >= 3 &&
+      page < NUM_SCREENS && rotation <= 3 && brightness <= BL_RANGE && type <= 1) {
+    displayType = type;
+    screenMode = page;
+    screenRotation = rotation;
+    blValue = brightness;
+  }
+#endif
+}
+
+static String jsonString(const String& value) {
+  String out = "\"";
+  for (size_t i=0; i<value.length(); ++i) {
+    const uint8_t c = value[i];
+    if (c == '"' || c == '\\') { out += '\\'; out += char(c); }
+    else if (c < 32) { char escaped[7]; snprintf(escaped, sizeof(escaped), "\\u%04x", c); out += escaped; }
+    else out += char(c);
+  }
+  return out + "\"";
+}
+
+static bool validFanHost(const String& host) {
+  if(host.isEmpty() || host.length()>63 || host[0]=='.' || host[host.length()-1]=='.') return false;
+  for(size_t i=0;i<host.length();++i) {
+    char c=host[i];
+    if(!((c>='a' && c<='z') || (c>='A' && c<='Z') || (c>='0' && c<='9') || c=='.' || c=='-')) return false;
+  }
+  return true;
+}
+static void loadFanSettings() {
+#if ENABLE_FS
+  if(!fsReady) return;
+  File f=LittleFS.open("/fan.cfg","r"); if(!f) return;
+  String enabled=f.readStringUntil('\n'), host=f.readStringUntil('\n'); f.close();
+  enabled.trim(); host.trim();
+  if((enabled=="0" || enabled=="1") && validFanHost(host)) { fanSendEnabled=enabled=="1"; fanHost=host; }
+#endif
+}
+static void handleFanSave() {
+  String enabled=server.arg("enabled"), host=server.arg("host"); host.trim();
+  if((enabled!="0" && enabled!="1") || !validFanHost(host)) {
+    server.send(400,"text/plain","Enter a controller IP address or hostname without http:// or a path."); return;
+  }
+#if ENABLE_FS
+  if(!fsReady) { server.send(500,"text/plain","Settings storage unavailable"); return; }
+  File f=LittleFS.open("/fan.tmp","w");
+  String data=enabled+"\n"+host+"\n";
+  bool ok=f && f.print(data)==data.length(); f.close();
+  if(!ok || !LittleFS.rename("/fan.tmp","/fan.cfg")) { server.send(500,"text/plain","Could not save fan settings"); return; }
+  fanSendEnabled=enabled=="1"; fanHost=host; fanLastHttp=0;
+  server.send(200,"text/plain","Fan controller settings saved. Readings send every 5 seconds when enabled.");
+#else
+  server.send(500,"text/plain","Settings storage unavailable");
+#endif
+}
+
+static void handleSettings() {
+  server.sendHeader("Cache-Control", "no-store");
+  String out = "{\"screen\":" + String(screenMode) + ",\"rotation\":" + String(screenRotation);
+  out += ",\"nativeWidth\":" + String(displayType == 1 ? 170 : 240);
+  out += ",\"displayType\":" + String(displayType);
+  out += ",\"nativeHeight\":" + String(ILI9341_TFTHEIGHT);
+  out += ",\"screenWidth\":" + String(SCREEN_WIDTH);
+  out += ",\"screenHeight\":" + String(SCREEN_HEIGHT);
+  out += ",\"brightness\":" + String(blValue);
+  out += ",\"fanHost\":" + jsonString(fanHost);
+  out += ",\"fanEnabled\":" + String(fanSendEnabled?"true":"false");
+  out += ",\"fanHttp\":" + String(fanLastHttp);
+  out += ",\"ssid\":" + jsonString(WiFi.SSID());
+  out += ",\"connected\":"; out += WiFi.status() == WL_CONNECTED ? "true" : "false";
+  out += ",\"ip\":" + jsonString(WiFi.localIP().toString());
+  out += ",\"setupSsid\":" + jsonString(AP_FALLBACK_SSID);
+  out += ",\"apActive\":"; out += apFallbackActive ? "true" : "false";
+  out += ",\"pending\":"; out += wifiChangePending ? "true" : "false";
+  out += "}";
+  server.send(200, "application/json", out);
+}
+
+static bool readSetting(const char* name, unsigned maximum, unsigned& value) {
+  if (!server.hasArg(name)) return false;
+  String s = server.arg(name);
+  if (s.length() == 0 || s.length() > 5) return false;
+  value = 0;
+  for (size_t i=0; i<s.length(); ++i) {
+    if (s[i] < '0' || s[i] > '9') return false;
+    value = value * 10 + s[i] - '0';
+  }
+  return value <= maximum;
+}
+
+static void handleScreenSave() {
+  unsigned page, rotation, brightness, type=displayType;
+  if ((server.hasArg("displayType") && !readSetting("displayType", 1, type)) || !readSetting("screen", NUM_SCREENS-1, page) ||
+      !readSetting("rotation", 3, rotation) ||
+      !readSetting("brightness", BL_RANGE, brightness)) {
+    server.send(400, "text/plain", "Invalid screen settings"); return;
+  }
+  if (!saveScreenSettings(page, rotation, brightness, type)) {
+    server.send(500, "text/plain", "Could not save screen settings"); return;
+  }
+  const bool changedDisplay = displayType != type;
+  displayType = type;
+  screenMode = page; screenRotation = rotation; blValue = brightness;
+  if (changedDisplay) initDisplay();
+  else applyScreenRotation();
+  applyBacklightOutput();
+  noteUserActivity(!screenOffForced);
+  if (!screenOff) drawAllScreens();
+  server.send(200, "text/plain", "Screen settings saved and applied.");
+}
+
+static void handleWifiSave() {
+  if (wifiChangePending) { server.send(409, "text/plain", "Wi-Fi change already pending"); return; }
+  String ssid = server.arg("ssid"), password = server.arg("password");
+  bool open = server.arg("open") == "1";
+  bool hexKey = password.length() == 64;
+  if (hexKey) for (size_t i=0; i<password.length(); ++i) if (!isxdigit((unsigned char)password[i])) hexKey = false;
+  if (ssid.length() == 0 || ssid.length() > 32 || strlen(ssid.c_str()) != ssid.length() ||
+      (!open && !hexKey && (password.length() < 8 || password.length() > 63)) || strlen(password.c_str()) != password.length()) {
+    server.send(400, "text/plain", "Enter an SSID (1-32 bytes) and password (8-63 characters or 64 hex digits), or select Open network."); return;
+  }
+  pendingSsid = ssid; pendingPassword = open ? "" : password;
+  wifiChangePending = true; wifiChangeAt = millis();
+  server.send(202, "text/plain", "Wi-Fi settings accepted. Connecting shortly; this page may disconnect. Open http://" OTA_HOSTNAME ".local on the new network. If connection fails, join the setup network and open http://192.168.4.1 to correct the settings.");
+}
+
+static void applyPendingWifi() {
+  if (!wifiChangePending || millis() - wifiChangeAt < 1500) return;
+  // Stop mDNS on the old interface and provide recovery before switching STA.
+#if ENABLE_OTA
+  if (otaReady) { ArduinoOTA.end(); otaReady = false; }
+#endif
+  if (mdnsStarted) { MDNS.close(); mdnsStarted = false; }
+  WiFi.persistent(false);
+  if (!apFallbackActive) startFallbackAP();
+  else WiFi.disconnect(false);
+  WiFi.persistent(true);
+  WiFi.begin(pendingSsid.c_str(), pendingPassword.c_str());
+  WiFi.persistent(false);
+  pendingPassword = ""; pendingSsid = "";
+  lastStaRetryMs = millis();
+  wifiChangePending = false;
+}
 
 static const char WEB_ROOT_HTML[] PROGMEM = R"HTML(
 <!doctype html><html lang="en"><head>
@@ -2524,6 +2687,27 @@ body::before{
 .controls.stack.control-grid .bar{min-height:40px}
 .controls.stack.control-grid .bar.full{grid-column:1/-1}
 @media(max-width:900px){.controls.stack.control-grid{grid-template-columns:1fr}}
+.controls-shell .bar{
+  padding:10px 12px;border:1px solid var(--stroke);border-radius:14px;
+  background:linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.015));
+}
+.controls-shell .bar-top .nav-group select{min-width:190px}
+.controls-shell .bar-top #liveChip{margin-left:auto}
+.controls-shell .bar-tools{align-items:flex-start}
+.controls-shell .bar-tools .graph-tools{flex:1 1 640px}
+.controls-shell .bar-tools .display-tools{
+  margin-left:auto;display:flex;gap:10px;align-items:center;flex:0 1 auto
+}
+.controls-shell .bar-tools .display-tools .range input[type=range]{width:130px}
+.controls-shell .bar-sched{justify-content:flex-start}
+.controls-shell .bar-sched .chip.time input[type=time]{min-width:110px}
+.controls-shell .quick-range{display:inline-flex;gap:8px;flex-wrap:wrap}
+.controls-shell .quick-range .pill{min-width:46px}
+@media(max-width:900px){
+  .controls-shell .bar{padding:9px}
+  .controls-shell .bar-top #liveChip{margin-left:0}
+  .controls-shell .bar-tools .display-tools{margin-left:0;flex:1 1 100%;justify-content:space-between}
+}
 .controls.scroll{
   flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;
   scrollbar-width:none;scroll-snap-type:x mandatory;
@@ -2598,12 +2782,26 @@ canvas{
   }
   .pill{padding:0 14px}
   select{min-width:0;max-width:100%;flex:1 1 auto}
+  .controls-shell .bar{padding:8px}
+  .controls-shell .bar .group{width:100%}
+  .controls-shell .bar-tools .graph-tools{gap:8px}
+  .controls-shell .bar-tools .display-tools{width:100%;gap:8px}
+  .controls-shell .bar-tools .display-tools .range{flex:1 1 auto}
+  .controls-shell .bar-top .nav-group select{min-width:0;flex:1 1 auto}
+  .controls-shell .quick-range{width:100%}
+  .controls-shell .quick-range .pill{flex:1 1 calc(25% - 8px)}
   .small{font-size:.86rem}
 }
 @media(max-width:420px){
   canvas{height:280px}
   .row button{width:44px;padding:0}
 }
+#deviceSettings summary{cursor:pointer;font-weight:600}
+#deviceSettings fieldset{min-width:0;border:1px solid var(--stroke);border-radius:8px}
+#deviceSettings .controls>label{display:flex;flex-wrap:wrap;align-items:center;gap:8px;max-width:100%}
+#deviceSettings input:not([type=checkbox]){max-width:100%;padding:8px;background:var(--input-bg);color:var(--input-text);border:1px solid var(--stroke);border-radius:8px}
+#deviceSettings select{max-width:100%}
+#settingsMessage{overflow-wrap:anywhere}
 </style></head><body><div class="wrap">
 <div class="top"><div class="head">
   <div class="h1"><b>Environment Monitor</b><span>Live + History - ACST/ACDT</span></div>
@@ -2627,17 +2825,18 @@ canvas{
   </div>
 </div>
 
-<div class="card fade-in">
+<div class="card fade-in controls-shell">
   <div class="controls stack control-grid">
-    <div class="bar">
-      <div class="group">
+    <div class="bar full bar-top">
+      <div class="group nav-group">
         <button class="pill" id="prev">Prev</button>
         <button class="pill" id="next">Next</button>
         <select id="day"></select>
       </div>
+      <div class="chip" id="liveChip"><span class="dot co2"></span><span id="live">Live: --</span></div>
     </div>
-    <div class="bar">
-      <div class="group">
+    <div class="bar full bar-tools">
+      <div class="group graph-tools">
         <label class="chip"><input id="smooth" type="checkbox" checked style="accent-color:var(--accent)"> Smooth</label>
         <label class="chip range tight" title="Smoothing strength">
           <span>Smoothness</span><input id="smoothAmt" type="range" min="1" max="6" step="1" value="3"><span class="val" id="smoothAmtVal">3</span>
@@ -2647,19 +2846,19 @@ canvas{
           <option value="area">CO2 Area</option>
           <option value="bar">CO2 Bars</option>
         </select>
-        <button class="pill" data-r="6h">6h</button>
-        <button class="pill" data-r="12h">12h</button>
-        <button class="pill" data-r="24h">24h</button>
-        <button class="pill" data-r="all">All</button>
+        <div class="quick-range">
+          <button class="pill" data-r="6h">6h</button>
+          <button class="pill" data-r="12h">12h</button>
+          <button class="pill" data-r="24h">24h</button>
+          <button class="pill" data-r="all">All</button>
+        </div>
       </div>
-    </div>
-    <div class="bar full">
-      <div class="chip" id="liveChip"><span class="dot co2"></span><span id="live">Live: --</span></div>
-      <div class="sp"></div>
+      <div class="group display-tools">
       <label class="chip range" title="TFT brightness"><span>Brightness</span><input id="br" type="range" min="5" max="100" value="90"></label>
       <button class="pill" id="scr" title="Toggle screen on/off">Screen: On</button>
+      </div>
     </div>
-    <div class="bar full">
+    <div class="bar full bar-sched">
       <label class="chip" title="Enable daily screen schedule">
         <input id="schedOn" type="checkbox" style="accent-color:var(--accent)"> Schedule
       </label>
@@ -2695,6 +2894,57 @@ canvas{
   </div>
 </div>
 
+<details class="card" id="deviceSettings">
+  <summary>Device settings: screen and Wi-Fi</summary>
+  <p class="small" id="networkInfo">Open settings to load device configuration.</p>
+  <form id="screenForm">
+    <fieldset><legend>Screen setup</legend>
+      <p class="small">TFT size: <output id="screenSize">Loading...</output> (width &times; height, pixels).</p>
+      <label>Display model <select id="displayType" name="displayType">
+        <option value="0">ILI9341 - 240 x 320</option>
+        <option value="1">1.9-inch ST7789 - 170 x 320</option>
+      </select></label>
+      <p class="small">Select the connected display. Both models use the existing display pins, including reset on D1.</p>
+
+      <div class="controls">
+        <label>Display page <select id="screenPage" name="screen">
+          <option value="0">30-minute dashboard</option><option value="1">Daily statistics</option>
+          <option value="2">24-hour temperature / humidity</option>
+          <option value="3">12-hour temperature / humidity</option>
+        </select></label>
+        <label>Orientation <select id="screenRotation" name="rotation">
+          <option value="1">Landscape</option><option value="3">Landscape flipped</option>
+          <option value="0">Portrait (vertical)</option><option value="2">Portrait flipped</option>
+        </select></label>
+        <label>Brightness <input id="screenBrightness" name="brightness" type="range" min="0" max="1023" value="900">
+          <output id="brightnessValue">88%</output></label>
+        <button id="saveScreen" type="submit" disabled>Save screen settings</button>
+      </div>
+      <p class="small">Applies immediately and restores on restart. Brightness 0 turns the backlight off. Existing screen power and schedule settings still apply.</p>
+    </fieldset>
+  </form>
+  <form id="fanForm" style="margin-top:12px">
+    <fieldset><legend>Fan controller readings</legend>
+      <label>Send temperature / humidity <select id="fanEnabled" name="enabled"><option value="1">Enabled</option><option value="0">Disabled</option></select></label>
+      <label>Fan controller IP or hostname <input id="fanHost" name="host" maxlength="63" required placeholder="greenhouse-fan.local"></label>
+      <button id="saveFan" type="submit" disabled>Save fan settings</button>
+      <p class="small">Both devices must be on the same reachable Wi-Fi network. Sends every 5 seconds, including while the screen is off. Use the IP shown on the fan controller if its hostname cannot be found.</p>
+      <p class="small" id="fanStatus"></p>
+    </fieldset>
+  </form>
+  <form id="wifiForm" style="margin-top:12px">
+    <fieldset><legend>Wi-Fi configuration</legend>
+      <div class="controls">
+        <label>Network name (SSID) <input id="wifiSsid" name="ssid" maxlength="32" required autocomplete="off"></label>
+        <label>Password <input id="wifiPassword" name="password" type="password" maxlength="64" required autocomplete="new-password"></label>
+        <label><input id="wifiOpen" type="checkbox"> Open network (no password)</label>
+        <button id="saveWifi" type="submit" disabled>Save and connect</button>
+      </div>
+      <p class="small">Enter the network password when saving. Saved passwords are never displayed. Changing networks may disconnect this page.</p>
+    </fieldset>
+  </form>
+  <p id="settingsMessage" role="status" aria-live="polite"></p>
+</details>
 <div id="tip"></div>
 </div>
 
@@ -2702,6 +2952,65 @@ canvas{
 (() => {
   const TODAY="__TODAY__";
   const $=id=>document.getElementById(id);
+  const settingsMessage = $("settingsMessage");
+  let nativeScreenWidth=0, nativeScreenHeight=0;
+  function updateScreenSize(){
+    nativeScreenWidth=$("displayType").value==="1"?170:240;
+    nativeScreenHeight=320;
+    const landscape=Number($("screenRotation").value)%2===1;
+    const width=landscape?nativeScreenHeight:nativeScreenWidth;
+    const height=landscape?nativeScreenWidth:nativeScreenHeight;
+    $("screenSize").textContent=width+" × "+height;
+  }
+  $("screenRotation").addEventListener("change", updateScreenSize);
+  $("displayType").addEventListener("change", updateScreenSize);
+  const updateBrightness = () => $("brightnessValue").textContent = Math.round(Number($("screenBrightness").value)*100/1023)+"%";
+  $("screenBrightness").addEventListener("input", updateBrightness);
+  $("wifiOpen").addEventListener("change", () => {
+    $("wifiPassword").disabled = $("wifiOpen").checked;
+    $("wifiPassword").required = !$("wifiOpen").checked;
+  });
+  $("deviceSettings").addEventListener("toggle", async () => {
+    if (!$("deviceSettings").open) return;
+    try {
+      const response = await fetch("/api/settings", {cache:"no-store"});
+      if (!response.ok) throw new Error("Could not load settings");
+      const s = await response.json();
+      $("fanHost").value=s.fanHost; $("fanEnabled").value=s.fanEnabled?"1":"0";
+      $("fanStatus").textContent=!s.fanEnabled?"Sending disabled":s.fanHttp===200?"Last reading accepted":s.fanHttp===0?"No send result yet":"Last send failed ("+s.fanHttp+")";
+      $("saveFan").disabled=false;
+      $("screenPage").value = s.screen;
+      $("screenRotation").value = s.rotation;
+      $("displayType").value=s.displayType;
+      updateScreenSize();
+      $("screenBrightness").value = s.brightness;
+      updateBrightness();
+      $("wifiSsid").value = s.ssid;
+      $("networkInfo").textContent = (s.connected ? "Connected to " + s.ssid + " at " + s.ip : "Wi-Fi disconnected") +
+        ". Recovery network: " + s.setupSsid + " (192.168.4.1)" + (s.apActive ? " - active." : " - available if setup fails.");
+      $("saveScreen").disabled = false;
+      $("saveWifi").disabled = s.pending;
+    } catch(e) { settingsMessage.textContent = "Could not load settings. Close and reopen settings to retry."; }
+  });
+  async function saveSettings(event, url, button) {
+    event.preventDefault();
+    button.disabled = true;
+    settingsMessage.textContent = "Saving...";
+    try {
+      const body = new URLSearchParams(new FormData(event.target));
+      if (url === "/api/wifi") body.set("open", $("wifiOpen").checked ? "1" : "0");
+      const response = await fetch(url, {method:"POST", body});
+      const message = await response.text();
+      if (!response.ok) throw new Error(message);
+      settingsMessage.textContent = message;
+      if (url === "/api/wifi") $("wifiPassword").value = "";
+      else if ($("br")) $("br").value = Math.round(Number($("screenBrightness").value)*100/1023);
+    } catch(e) { settingsMessage.textContent = "Save could not be confirmed: " + e.message; }
+    finally { button.disabled = false; }
+  }
+  $("screenForm").addEventListener("submit", e => saveSettings(e, "/api/screen", $("saveScreen")));
+  $("fanForm").addEventListener("submit", e => saveSettings(e, "/api/fan", $("saveFan")));
+  $("wifiForm").addEventListener("submit", e => saveSettings(e, "/api/wifi", $("saveWifi")));
   const LS={g:(k,d)=>{try{const v=localStorage.getItem(k);return v==null?d:JSON.parse(v)}catch(e){return d}},
             s:(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}};
 
@@ -2796,8 +3105,17 @@ canvas{
     fetch(`/api/brightness?pct=${v}`, {method:"POST"}).catch(()=>{});
   }
 
-  function fetchJSON(url){
-    return fetch(url,{cache:"no-store"}).then(r=>r.json());
+  async function fetchJSON(url){
+    const r = await fetch(url, {cache:"no-store"});
+    const txt = await r.text();
+    if (!r.ok) {
+      throw new Error(`${url} -> HTTP ${r.status}: ${txt.slice(0,160)}`);
+    }
+    try {
+      return JSON.parse(txt);
+    } catch (e) {
+      throw new Error(`${url} -> invalid JSON: ${txt.slice(0,160)}`);
+    }
   }
 
   function setPowerUI(js){
@@ -2901,12 +3219,13 @@ canvas{
       return `${year}-${mm}-${dd}`;
     }
 
-    dayList.forEach(d=>{
+    for(let i=dayList.length-1;i>=0;i--){
+      const d=dayList[i];
       const o=document.createElement("option");
       if(typeof d==="string"){ o.value=d; o.textContent=d; }
       else { o.value=d.name; o.textContent=formatDayName(d.name, d.label)||d.name; }
       sel.appendChild(o);
-    });
+    }
 
     const last=LS.g("daySel",TODAY);
     const ok=[...sel.options].some(o=>o.value===last);
@@ -2918,7 +3237,9 @@ canvas{
       dayList=Array.isArray(list)?list:[];
       buildDaySelect();
       load(sel.value,true);
-    }).catch(()=>{});
+    }).catch((err)=>{
+      console.error("daylist load failed:", err);
+    });
   }
 
   function shiftDay(dir){
@@ -3036,7 +3357,14 @@ canvas{
       $("stTitle").textContent=(name===TODAY)?"Today stats":"Day stats";
       renderStats();
       scheduleDraw();
-    }).catch(()=>{ data=null; scheduleDraw(); renderStats(); });
+    }).catch((err)=>{
+      console.error("daydata load failed:", name, err);
+      data=null;
+      scheduleDraw();
+      renderStats();
+      const info = $("stInfo");
+      if (info) info.textContent = "Load failed (see browser console)";
+    });
   }
   sel.addEventListener("change",()=>load(sel.value,true));
 
@@ -3888,15 +4216,37 @@ static void handleCo2Offset() {
 }
 #endif
 
+static void sendFanReadings() {
+  uint32_t now=millis();
+  if(!fanSendEnabled || WiFi.status()!=WL_CONNECTED || now-fanLastAttempt<5000) return;
+  fanLastAttempt=now;
+  // lwIP resolves ordinary DNS and .local mDNS, with a bounded timeout.
+  IPAddress address;
+  if(!WiFi.hostByName(fanHost.c_str(),address,1000)) { fanLastHttp=-100; return; }
+  String host=address.toString();
+  const uint32_t age=millis()-fanSampleTime;
+  const bool good=fanHaveSample && age<=10000 && isfinite(currentTemp) && isfinite(currentHum);
+  String packet="{\"node\":\"temphumlogger\",\"boot\":"+String(fanBoot)+",\"seq\":"+String(++fanSequence)+",\"valid\":"+(good?"true":"false");
+  if(good) packet+=",\"age_ms\":"+String(age)+",\"temperature\":"+String(currentTemp,1)+",\"humidity\":"+String(currentHum,1);
+  packet+="}";
+  WiFiClient client; client.setTimeout(1000);
+  HTTPClient http; http.setTimeout(1000); http.setReuse(false);
+  if(!http.begin(client,"http://"+host+"/api/climate")) { fanLastHttp=-101; return; }
+  http.addHeader("Content-Type","application/json"); http.addHeader("X-Sensor-Key",FAN_SENSOR_KEY);
+  fanLastHttp=http.POST(packet); http.end();
+}
+
 #if ENABLE_AC_HTTP
 static void acSendEnv() {
   if (WiFi.status() != WL_CONNECTED) return;
-  if (isnan(currentTemp) && isnan(currentHum) && isnan(currentCO2)) return;
-
   uint32_t nowMs = millis();
+  // Only refresh the receiver while the DHT temperature is current.
+  if (!fanHaveSample || (uint32_t)(nowMs - fanSampleTime) > 10000 || !isfinite(currentTemp)) return;
   if ((uint32_t)(nowMs - acLastSendMs) < AC_HTTP_MIN_SEND_MS) return;
 
-  String url = String("http://") + AC_HTTP_HOST + "/api/env?";
+  IPAddress address;
+  if (!WiFi.hostByName(AC_HTTP_HOST, address, 1000)) return;
+  String url = String("http://") + address.toString() + "/api/env?";
   bool first = true;
   if (!isnan(currentTemp)) {
     url += "temp=" + String(currentTemp, 1);
@@ -3914,6 +4264,7 @@ static void acSendEnv() {
 
   WiFiClient client;
   HTTPClient http;
+  http.setTimeout(1000);
   if (!http.begin(client, url)) return;
   int code = http.GET();
   http.end();
@@ -4147,12 +4498,17 @@ static void handleDayData() {
     else sendS(String(decodeHum(hBuf[i]), 0));
   }
   sendC("]}");
+
+  // Terminate chunked response so browser fetch can finish reliably.
+  server.sendContent("");
+  server.client().stop();
 #endif
 }
 
 // ===================== setup / loop =====================
 void setup(){
   Serial.begin(115200);
+  fanBoot=os_random();
   bootTime = millis();
 
   // Backlight
@@ -4161,15 +4517,6 @@ void setup(){
   analogWriteFreq(BL_PWM_HZ);
   analogWriteRange(BL_RANGE);
   applyBrightnessPct(getBrightnessPct());
-
-  // TFT
-  tft.init(TFT_RAW_WIDTH, TFT_RAW_HEIGHT);
-  tft.setRotation(3); // landscape flipped (320w x 170h)
-  tft.fillScreen(COL_BG);
-  tft.setTextSize(2);
-  tft.setTextColor(COL_ACCENT, COL_BG);
-  tft.setCursor(10, 8);
-  tft.print("Booting...");
 
   // Data
   clearData();
@@ -4196,6 +4543,12 @@ void setup(){
   }
 #endif
 
+  loadScreenSettings();
+  loadFanSettings();
+  initDisplay();
+  tft.fillScreen(COL_BG);
+  applyBacklightOutput();
+
   // Sensor
   initSensor();
 
@@ -4211,6 +4564,10 @@ void setup(){
   server.on("/api/daydata", HTTP_GET, handleDayData);
   server.on("/api/today",   HTTP_GET, handleToday);
   server.on("/status",      HTTP_GET, handleStatus);
+  server.on("/api/settings", HTTP_GET, handleSettings);
+  server.on("/api/screen", HTTP_POST, handleScreenSave);
+  server.on("/api/fan", HTTP_POST, handleFanSave);
+  server.on("/api/wifi", HTTP_POST, handleWifiSave);
   server.on("/api/power",   HTTP_ANY, handlePowerSave);
 #if ENABLE_BL_HTTP
   server.on("/api/brightness", HTTP_ANY, handleBrightness);
@@ -4265,6 +4622,7 @@ void loop() {
   // ---------- Network tasks ----------
   if (WiFi.getMode() != WIFI_OFF) {
     server.handleClient();
+    applyPendingWifi();
     if (apFallbackActive) {
       dnsServer.processNextRequest();
       retryStaWhileAp();
@@ -4431,6 +4789,7 @@ void loop() {
 
     if (!isnan(t) && !isnan(h) && t > -10 && t < 60 && h >= 0 && h <= 100) {
       lastSensorData = nowMs;
+      fanHaveSample=true; fanSampleTime=millis();
       currentTemp = t;
       currentHum  = h;
       tempHumSampled = true;
@@ -4468,6 +4827,8 @@ void loop() {
   if (gotSample) {
     writeLiveSlotPreviewToBuffers();
   }
+
+  sendFanReadings();
 
 // ---------- AC Control (HTTP) ----------
 #if ENABLE_AC_HTTP
